@@ -149,8 +149,8 @@ func verifyInteraction(r *http.Request, pubKey ed25519.PublicKey) ([]byte, bool)
 	return body, ed25519.Verify(pubKey, msg, sig)
 }
 
-func updateMessageWithImage(appID, token string, imgBlob []byte) error {
-	url := fmt.Sprintf("https://discord.com/api/v10/webhooks/%s/%s/messages/@original", appID, token)
+func createFollowupMessage(appID, token string, imgBlob []byte) error {
+	url := fmt.Sprintf("https://discord.com/api/v10/webhooks/%s/%s", appID, token)
 
 	body := &bytes.Buffer{}
 	writer := multipart.NewWriter(body)
@@ -161,11 +161,11 @@ func updateMessageWithImage(appID, token string, imgBlob []byte) error {
 	}
 	part.Write(imgBlob)
 
-	payload := `{"content": "Time to play 4×3! (Completed)"}`
+	payload := `{"content": "A player finished their 4×3 game!"}`
 	_ = writer.WriteField("payload_json", payload)
 	writer.Close()
 
-	req, err := http.NewRequest("PATCH", url, body)
+	req, err := http.NewRequest("POST", url, body)
 	if err != nil {
 		return err
 	}
@@ -244,9 +244,9 @@ if (inDiscord) {
 });
 
 // Auto-post image on finish
-const originalShowEnd = window.showEnd;
+const originalShowEnd = openModal;
 if (typeof originalShowEnd === 'function') {
-  window.showEnd = function(fancy) {
+  openModal = function(fancy) {
     originalShowEnd(fancy);
     if (!window.__uploadedResult && inDiscord && window.discordSdk && window.discordSdk.channelId) {
       window.__uploadedResult = true;
@@ -421,8 +421,8 @@ if (typeof originalShowEnd === 'function') {
 		}
 
 		go func() {
-			if err := updateMessageWithImage(session.AppID, session.Token, imgBlob); err != nil {
-				log.Printf("Failed to update message: %v", err)
+			if err := createFollowupMessage(session.AppID, session.Token, imgBlob); err != nil {
+				log.Printf("Failed to create followup message: %v", err)
 			}
 		}()
 		w.WriteHeader(200)
