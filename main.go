@@ -12,38 +12,54 @@ import (
 	"strings"
 )
 
-// followRedirectsTransport follows HTTP redirects internally so they are
-// never exposed to the browser. Without this, a 308 from Vercel reaches
-// the client and the browser follows it directly — bypassing our proxy
-// and hitting Vercel CORS restrictions.
+// followRedirectsTransport follows HTTP redirects internally so 3xx responses
+// from Vercel/hankgreen are never forwarded to the browser.
+//
+// We use http.DefaultTransport.RoundTrip directly (not http.Client.Do) so that
+// response bodies are streamed immediately with no extra buffering — http.Client
+// adds connection-lifecycle overhead that delayed chunked/streaming responses by
+// over a minute.
 type followRedirectsTransport struct{}
 
 func (followRedirectsTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	client := &http.Client{
-		CheckRedirect: func(r *http.Request, via []*http.Request) error {
-			// Carry the original headers (e.g. Accept, User-Agent) across redirects.
-			if len(via) > 0 {
-				for key, vals := range via[0].Header {
-					if r.Header.Get(key) == "" {
-						for _, v := range vals {
-							r.Header.Add(key, v)
-						}
-					}
-				}
-			}
-			if len(via) >= 10 {
-				return fmt.Errorf("too many redirects")
-			}
-			log.Printf("[proxy] following redirect → %s", r.URL)
-			return nil
-		},
-		Transport: http.DefaultTransport,
-	}
-	// http.Client.Do rejects requests where RequestURI is set (that field is
-	// only valid on incoming server-side requests). httputil.ReverseProxy's
-	// Director populates it, so we must clear it before the outgoing call.
+	// httputil.ReverseProxy's Director sets RequestURI, which http.Transport
+	// rejects on outgoing requests. Clear it before the first hop.
 	req.RequestURI = ""
-	return client.Do(req)
+
+	resp, err := http.DefaultTransport.RoundTrip(req)
+	if err != nil {
+		return nil, err
+	}
+
+	// Manually follow up to 10 redirects, chaining RoundTrip calls so the
+	// final response body is always a direct stream from the upstream.
+	for i := 0; i < 10 && isRedirect(resp.StatusCode); i++ {
+		resp.Body.Close()
+		loc, err := resp.Location()
+		if err != nil {
+			break
+		}
+		log.Printf("[proxy] following redirect → %s", loc)
+		next := req.Clone(req.Context())
+		next.URL = loc
+		next.Host = loc.Host
+		next.RequestURI = ""
+		resp, err = http.DefaultTransport.RoundTrip(next)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return resp, nil
+}
+
+func isRedirect(status int) bool {
+	switch status {
+	case http.StatusMovedPermanently, http.StatusFound,
+		http.StatusSeeOther, http.StatusTemporaryRedirect,
+		http.StatusPermanentRedirect:
+		return true
+	}
+	return false
 }
 
 // indexHTML is embedded at compile time from client/index.html.
