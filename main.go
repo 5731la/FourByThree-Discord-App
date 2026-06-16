@@ -149,7 +149,7 @@ func verifyInteraction(r *http.Request, pubKey ed25519.PublicKey) ([]byte, bool)
 	return body, ed25519.Verify(pubKey, msg, sig)
 }
 
-func createFollowupMessage(appID, token, userID string, imgBlob []byte) error {
+func createFollowupMessage(appID, token, userID, textResult string, imgBlob []byte) error {
 	url := fmt.Sprintf("https://discord.com/api/v10/webhooks/%s/%s", appID, token)
 
 	body := &bytes.Buffer{}
@@ -161,8 +161,23 @@ func createFollowupMessage(appID, token, userID string, imgBlob []byte) error {
 	}
 	part.Write(imgBlob)
 
-	payload := fmt.Sprintf(`{"content": "<@%s> finished their 4×3 game!"}`, userID)
-	_ = writer.WriteField("payload_json", payload)
+	payloadStruct := struct {
+		Content     string `json:"content"`
+		Attachments []struct {
+			ID          int    `json:"id"`
+			Description string `json:"description"`
+		} `json:"attachments"`
+	}{
+		Content: fmt.Sprintf("<@%s> finished their 4×3 game!", userID),
+		Attachments: []struct {
+			ID          int    `json:"id"`
+			Description string `json:"description"`
+		}{
+			{ID: 0, Description: textResult},
+		},
+	}
+	payloadBytes, _ := json.Marshal(payloadStruct)
+	_ = writer.WriteField("payload_json", string(payloadBytes))
 	writer.Close()
 
 	req, err := http.NewRequest("POST", url, body)
@@ -287,6 +302,7 @@ if (typeof originalShowEnd === 'function') {
           const formData = new FormData();
           formData.append('image', blob, 'result.png');
           formData.append('user_id', authenticatedUserId);
+          try { formData.append('text_result', window.resultDescription()); } catch(err) {}
           await fetch('api/result', { method: 'POST', body: formData });
         });
       } catch (e) { console.error('Upload failed', e); }
@@ -484,6 +500,7 @@ if (typeof originalShowEnd === 'function') {
 		}
 
 		userID := r.FormValue("user_id")
+		textResult := r.FormValue("text_result")
 		file, _, err := r.FormFile("image")
 		if err != nil || userID == "" {
 			http.Error(w, "missing fields", 400)
@@ -507,7 +524,7 @@ if (typeof originalShowEnd === 'function') {
 		}
 
 		go func() {
-			if err := createFollowupMessage(session.AppID, session.Token, userID, imgBlob); err != nil {
+			if err := createFollowupMessage(session.AppID, session.Token, userID, textResult, imgBlob); err != nil {
 				log.Printf("Failed to create followup message: %v", err)
 			}
 		}()
