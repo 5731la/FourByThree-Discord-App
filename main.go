@@ -25,8 +25,9 @@ var cspMetaRe = regexp.MustCompile(`(?i)<meta[^>]+http-equiv=["']?Content-Securi
 
 // inlineEventsRe matches inline event handlers like onclick="..." which Discord's
 // CSP blocks because it removes the 'unsafe-inline' keyword. We rewrite them to
-// data-onclick="..." and bind them dynamically.
-var inlineEventsRe = regexp.MustCompile(`(?i)\b(on(?:click|keydown|input|error|load|change|submit))="([^"]*)"`)
+// data-onclick="..." and bind them dynamically. This regex matches both single
+// and double quotes to catch handlers inside dynamically injected HTML strings.
+var inlineEventsRe = regexp.MustCompile(`(?i)\b(on(?:click|keydown|input|error|load|change|submit))=(["'][^"']*["'])`)
 
 // upstreamTransport is used for all requests to hankgreen.com.
 //
@@ -130,7 +131,23 @@ if (inDiscord) {
   console.log('[4x3] Running outside Discord');
 }
 
-['click', 'keydown', 'input', 'error', 'load', 'change', 'submit'].forEach(evt => {
+['click', 'keydown', 'input', 'change', 'submit'].forEach(evt => {
+  document.addEventListener(evt, function(event) {
+    let target = event.target;
+    while (target && target !== document) {
+      if (target.hasAttribute && target.hasAttribute('data-on' + evt)) {
+        const code = target.getAttribute('data-on' + evt);
+        const res = new Function('event', code).call(target, event);
+        if (res === false) {
+          event.preventDefault();
+        }
+      }
+      target = target.parentNode;
+    }
+  });
+});
+
+['error', 'load'].forEach(evt => {
   document.querySelectorAll('[data-on' + evt + ']').forEach(el => {
     const code = el.getAttribute('data-on' + evt);
     el.addEventListener(evt, function(event) {
@@ -174,7 +191,7 @@ if (inDiscord) {
 
 			// Rewrite inline event handlers (onclick="..." -> data-onclick="...")
 			// so they bypass Discord's strict CSP blocking 'unsafe-inline'.
-			modified = inlineEventsRe.ReplaceAll(modified, []byte(`data-$1="$2"`))
+			modified = inlineEventsRe.ReplaceAll(modified, []byte(`data-$1=$2`))
 
 			resp.Body = io.NopCloser(bytes.NewReader(modified))
 			resp.ContentLength = int64(len(modified))
