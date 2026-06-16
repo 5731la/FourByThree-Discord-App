@@ -244,9 +244,9 @@ if (inDiscord) {
 });
 
 // Auto-post image on finish
-const originalShowEnd = openModal;
+const originalShowEnd = showResult;
 if (typeof originalShowEnd === 'function') {
-  openModal = function(fancy) {
+  showResult = function(fancy) {
     originalShowEnd(fancy);
     if (!window.__uploadedResult && inDiscord && window.discordSdk && window.discordSdk.channelId) {
       window.__uploadedResult = true;
