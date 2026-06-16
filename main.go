@@ -201,6 +201,10 @@ func main() {
 		pubKey = ed25519.PublicKey(b)
 	}
 	clientSecret := os.Getenv("DISCORD_CLIENT_SECRET")
+	redirectURI := os.Getenv("DISCORD_REDIRECT_URI")
+	if redirectURI == "" {
+		redirectURI = "https://fourbythreediscord.stellasec.com"
+	}
 
 	// discordSDKScript is injected into every HTML page served from hankgreen.com.
 	// 1. Initialises the Discord Embedded App SDK if running inside an Activity.
@@ -445,6 +449,7 @@ if (typeof originalShowEnd === 'function') {
 		data.Set("client_secret", clientSecret)
 		data.Set("grant_type", "authorization_code")
 		data.Set("code", reqBody.Code)
+		data.Set("redirect_uri", redirectURI)
 
 		req, err := http.NewRequest("POST", "https://discord.com/api/v10/oauth2/token", strings.NewReader(data.Encode()))
 		if err != nil {
