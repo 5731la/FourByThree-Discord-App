@@ -28,8 +28,7 @@ The Go server is deliberately minimal:
 3. Under **URL Mappings**, add:
    | Prefix | Target |
    |---|---|
-   | `/` | `your-server-hostname.com` (your tunnel/VPS URL — no `https://`) |
-   | `/hankgreen` | `www.hankgreen.com` |
+   | `/` | `fourbythreediscord.stellasec.com` (your tunnel/VPS URL — no `https://`) |
 4. Copy your **Application (Client) ID**
 
 ### 2. Configure environment

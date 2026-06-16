@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"crypto/tls"
 	"embed"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"net/http"
@@ -37,7 +39,7 @@ var upstreamTransport http.RoundTripper = &http.Transport{
 // followRedirectsTransport follows HTTP redirects internally so 3xx responses
 // from Vercel/hankgreen are never forwarded to the browser.
 //
-// We use http.DefaultTransport.RoundTrip directly (not http.Client.Do) so that
+// We use upstreamTransport.RoundTrip directly (not http.Client.Do) so that
 // response bodies are streamed immediately with no extra buffering — http.Client
 // adds connection-lifecycle overhead that delayed chunked/streaming responses by
 // over a minute.
@@ -84,12 +86,6 @@ func isRedirect(status int) bool {
 	return false
 }
 
-// indexHTML is embedded at compile time from client/index.html.
-// The file lives on disk for easy editing; the binary stays self-contained.
-//
-//go:embed client/index.html
-var indexHTML []byte
-
 // staticFiles serves the Discord SDK and any other static assets from
 // client/static/, avoiding CDN MIME-type and CORS issues.
 //
@@ -106,66 +102,94 @@ func main() {
 		port = "4343"
 	}
 
-	// Reverse proxy to hankgreen.com for local development.
-	// In Discord, the Dev Portal URL Mapping handles /hankgreen → www.hankgreen.com.
+	// discordSDKScript is injected into every HTML page served from hankgreen.com.
+	// It initialises the Discord Embedded App SDK only when the page is loaded
+	// inside a Discord Activity (detected via the frame_id query param).
+	discordSDKScript := fmt.Sprintf(`<script type="module">
+const inDiscord = new URLSearchParams(window.location.search).has('frame_id');
+if (inDiscord) {
+  const { DiscordSDK } = await import('/static/index.mjs');
+  const sdk = new DiscordSDK(%q);
+  await sdk.ready();
+  console.log('[4x3] Discord SDK ready');
+} else {
+  console.log('[4x3] Running outside Discord');
+}
+</script>`, clientID)
+
+	// Reverse proxy to hankgreen.com.
+	// All game paths are forwarded directly — no nested iframe — so that
+	// Next.js client-side routing works at the correct path (/fourbythree).
 	target, _ := url.Parse("https://www.hankgreen.com")
 	proxy := httputil.NewSingleHostReverseProxy(target)
-
-	// Follow redirects inside the proxy so 3xx responses from Vercel/hankgreen
-	// are never forwarded to the browser.
 	proxy.Transport = followRedirectsTransport{}
 
 	proxy.ModifyResponse = func(resp *http.Response) error {
 		log.Printf("[proxy] upstream %s %s → %d", resp.Request.Method, resp.Request.URL, resp.StatusCode)
-		// Remove headers that would prevent the page from being embedded.
+
+		// Remove headers that would prevent embedding.
 		resp.Header.Del("X-Frame-Options")
 		resp.Header.Del("Content-Security-Policy")
 		resp.Header.Del("Content-Security-Policy-Report-Only")
-		// Ensure CORS is open for local dev.
 		resp.Header.Set("Access-Control-Allow-Origin", "*")
+
+		// Inject the Discord SDK initialisation script into HTML responses.
+		// This replaces the old nested-iframe approach: the game now runs
+		// directly in the Discord Activity iframe at the correct URL path.
+		ct := resp.Header.Get("Content-Type")
+		if resp.StatusCode == http.StatusOK && strings.Contains(ct, "text/html") {
+			body, err := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if err != nil {
+				return err
+			}
+			modified := bytes.Replace(body, []byte("</body>"), []byte(discordSDKScript+"\n</body>"), 1)
+			resp.Body = io.NopCloser(bytes.NewReader(modified))
+			resp.ContentLength = int64(len(modified))
+			resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(modified)))
+			// Remove transfer-encoding so the fixed Content-Length is authoritative.
+			resp.Header.Del("Transfer-Encoding")
+		}
+
 		return nil
 	}
 
 	mux := http.NewServeMux()
 
-	// Wrapper page — the Discord Activity entry point.
-	// Injects DISCORD_CLIENT_ID into the page via a small inline script before </head>.
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/" {
-			http.NotFound(w, r)
-			return
-		}
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-
-		// Inject the client ID as a global JS variable so index.html can use it
-		// without needing a build step or template engine.
-		injection := fmt.Sprintf(
-			`<script>window.__DISCORD_CLIENT_ID__ = %q;</script>`,
-			clientID,
-		)
-		html := strings.Replace(string(indexHTML), "</head>", injection+"\n</head>", 1)
-		fmt.Fprint(w, html)
-	})
-
 	// Serve the Discord SDK and other static assets from client/static/.
-	// Using a local copy avoids CDN CORS restrictions and wrong MIME types.
 	staticFS, err := fs.Sub(staticFiles, "client/static")
 	if err != nil {
 		log.Fatalf("static fs error: %v", err)
 	}
 	mux.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.FS(staticFS))))
 
-	// Local dev proxy: /hankgreen/* → https://www.hankgreen.com/*
-	// Strips the /hankgreen prefix before forwarding.
-	mux.HandleFunc("/hankgreen/", func(w http.ResponseWriter, r *http.Request) {
-		r.URL.Path = strings.TrimPrefix(r.URL.Path, "/hankgreen")
-		r.URL.RawPath = strings.TrimPrefix(r.URL.RawPath, "/hankgreen")
-		// IMPORTANT: clear r.Host so the reverse proxy uses the target host
-		// (www.hankgreen.com) as the Host header rather than forwarding the
-		// client's host (e.g. 192.168.100.138:3000). Vercel rejects unknown
-		// hosts with a 308 redirect to its canonical deployment URL.
+	// proxyHandler strips a path prefix then forwards to hankgreen.com.
+	proxyHandler := func(stripPrefix string) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			r.URL.Path = strings.TrimPrefix(r.URL.Path, stripPrefix)
+			r.URL.RawPath = strings.TrimPrefix(r.URL.RawPath, stripPrefix)
+			r.Host = ""
+			log.Printf("[proxy] → https://www.hankgreen.com%s", r.URL.Path)
+			proxy.ServeHTTP(w, r)
+		}
+	}
+
+	// /fourbythree/* — the game itself and its assets (puzzles.json, images, etc.)
+	mux.HandleFunc("/fourbythree/", proxyHandler(""))
+	mux.HandleFunc("/fourbythree", proxyHandler(""))
+
+	// /_next/* — Next.js static bundles (JS, CSS) referenced by absolute path in the HTML.
+	mux.HandleFunc("/_next/", proxyHandler(""))
+
+	// / — redirect to the game's canonical path so Discord Activity URL "/" works.
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" {
+			http.Redirect(w, r, "/fourbythree", http.StatusFound)
+			return
+		}
+		// Catch-all: proxy everything else to hankgreen.com as-is.
 		r.Host = ""
-		log.Printf("[proxy] → https://www.hankgreen.com%s", r.URL.Path)
+		log.Printf("[proxy] → https://www.hankgreen.com%s (catch-all)", r.URL.Path)
 		proxy.ServeHTTP(w, r)
 	})
 
