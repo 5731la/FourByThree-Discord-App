@@ -23,6 +23,11 @@ import (
 // so its nonce-based policy does not block inline event handlers in the game.
 var cspMetaRe = regexp.MustCompile(`(?i)<meta[^>]+http-equiv=["']?Content-Security-Policy["']?[^>]*/?>`)
 
+// inlineEventsRe matches inline event handlers like onclick="..." which Discord's
+// CSP blocks because it removes the 'unsafe-inline' keyword. We rewrite them to
+// data-onclick="..." and bind them dynamically.
+var inlineEventsRe = regexp.MustCompile(`(?i)\b(on(?:click|keydown|input|error|load|change|submit))="([^"]*)"`)
+
 // upstreamTransport is used for all requests to hankgreen.com.
 //
 // HTTP/2 is deliberately disabled. hankgreen.com (Vercel) uses HTTP/2
@@ -110,8 +115,10 @@ func main() {
 	}
 
 	// discordSDKScript is injected into every HTML page served from hankgreen.com.
-	// It initialises the Discord Embedded App SDK only when the page is loaded
-	// inside a Discord Activity (detected via the frame_id query param).
+	// 1. Initialises the Discord Embedded App SDK if running inside an Activity.
+	// 2. Restores inline event handlers (onclick, etc.) that Discord's CSP blocks.
+	//    Discord's proxy strips 'unsafe-inline' but keeps 'unsafe-eval', allowing
+	//    us to bind the rewritten data-on* attributes using new Function().
 	discordSDKScript := fmt.Sprintf(`<script type="module">
 const inDiscord = new URLSearchParams(window.location.search).has('frame_id');
 if (inDiscord) {
@@ -122,6 +129,15 @@ if (inDiscord) {
 } else {
   console.log('[4x3] Running outside Discord');
 }
+
+['click', 'keydown', 'input', 'error', 'load', 'change', 'submit'].forEach(evt => {
+  document.querySelectorAll('[data-on' + evt + ']').forEach(el => {
+    const code = el.getAttribute('data-on' + evt);
+    el.addEventListener(evt, function(event) {
+      new Function('event', code).call(this, event);
+    });
+  });
+});
 </script>`, clientID)
 
 	// Reverse proxy to hankgreen.com.
@@ -155,6 +171,11 @@ if (inDiscord) {
 			// HTML body as well as the header, and its nonce blocks the game's
 			// own inline event handlers when served inside Discord's iframe.
 			modified = cspMetaRe.ReplaceAll(modified, nil)
+
+			// Rewrite inline event handlers (onclick="..." -> data-onclick="...")
+			// so they bypass Discord's strict CSP blocking 'unsafe-inline'.
+			modified = inlineEventsRe.ReplaceAll(modified, []byte(`data-$1="$2"`))
+
 			resp.Body = io.NopCloser(bytes.NewReader(modified))
 			resp.ContentLength = int64(len(modified))
 			resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(modified)))
