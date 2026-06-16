@@ -3,3 +3,4 @@
 FourByThree-Discord-App
 # client/static/ contains the vendored Discord SDK — commit it so the build is self-contained
 client/static
+fourbythree-discord-app

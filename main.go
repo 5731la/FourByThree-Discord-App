@@ -2,18 +2,23 @@ package main
 
 import (
 	"bytes"
+	"crypto/ed25519"
 	"crypto/tls"
 	"embed"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/fs"
 	"log"
+	"mime/multipart"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -63,6 +68,13 @@ func (followRedirectsTransport) RoundTrip(req *http.Request) (*http.Response, er
 	// rejects on outgoing requests. Clear it before the first hop.
 	req.RequestURI = ""
 
+	// Force uncompressed responses from hankgreen.com so our ModifyResponse
+	// can process HTML bodies (inject SDK script, strip CSP meta tag) as
+	// plain text. Discord's proxy sends Accept-Encoding: gzip, which without
+	// this would cause Vercel to return a gzipped response that bypasses our
+	// regex rewrites.
+	req.Header.Set("Accept-Encoding", "identity")
+
 	resp, err := upstreamTransport.RoundTrip(req)
 	if err != nil {
 		return nil, err
@@ -105,6 +117,69 @@ func isRedirect(status int) bool {
 //go:embed all:client/static
 var staticFiles embed.FS
 
+// activeGames maps a Discord channel ID to the most recent invitation message ID
+var activeGames = struct {
+	sync.RWMutex
+	m map[string]string
+}{m: make(map[string]string)}
+
+func verifyInteraction(r *http.Request, pubKey ed25519.PublicKey) ([]byte, bool) {
+	sigHex := r.Header.Get("X-Signature-Ed25519")
+	ts := r.Header.Get("X-Signature-Timestamp")
+	if sigHex == "" || ts == "" {
+		return nil, false
+	}
+	sig, err := hex.DecodeString(sigHex)
+	if err != nil || len(sig) != ed25519.SignatureSize {
+		return nil, false
+	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		return nil, false
+	}
+	r.Body = io.NopCloser(bytes.NewReader(body))
+
+	msg := []byte(ts)
+	msg = append(msg, body...)
+	return body, ed25519.Verify(pubKey, msg, sig)
+}
+
+func updateMessageWithImage(channelID, messageID, token string, imgBlob []byte) error {
+	url := fmt.Sprintf("https://discord.com/api/v10/channels/%s/messages/%s", channelID, messageID)
+
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+
+	part, err := writer.CreateFormFile("files[0]", "result.png")
+	if err != nil {
+		return err
+	}
+	part.Write(imgBlob)
+
+	payload := `{"content": "Time to play 4×3! (Completed)"}`
+	_ = writer.WriteField("payload_json", payload)
+	writer.Close()
+
+	req, err := http.NewRequest("PATCH", url, body)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bot "+token)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("discord API error: %d %s", resp.StatusCode, string(b))
+	}
+	return nil
+}
+
 func main() {
 	clientID := os.Getenv("DISCORD_CLIENT_ID")
 	if clientID == "" {
@@ -114,6 +189,14 @@ func main() {
 	if port == "" {
 		port = "4343"
 	}
+
+	pubKeyHex := os.Getenv("DISCORD_PUBLIC_KEY")
+	var pubKey ed25519.PublicKey
+	if pubKeyHex != "" {
+		b, _ := hex.DecodeString(pubKeyHex)
+		pubKey = ed25519.PublicKey(b)
+	}
+	botToken := os.Getenv("DISCORD_BOT_TOKEN")
 
 	// discordSDKScript is injected into every HTML page served from hankgreen.com.
 	// 1. Initialises the Discord Embedded App SDK if running inside an Activity.
@@ -125,6 +208,7 @@ const inDiscord = new URLSearchParams(window.location.search).has('frame_id');
 if (inDiscord) {
   const { DiscordSDK } = await import('/static/index.mjs');
   const sdk = new DiscordSDK(%q);
+  window.discordSdk = sdk;
   await sdk.ready();
   console.log('[4x3] Discord SDK ready');
 } else {
@@ -155,6 +239,26 @@ if (inDiscord) {
     });
   });
 });
+
+// Auto-post image on finish
+const originalShowEnd = window.showEnd;
+if (typeof originalShowEnd === 'function') {
+  window.showEnd = function(fancy) {
+    originalShowEnd(fancy);
+    if (!window.__uploadedResult && inDiscord && window.discordSdk && window.discordSdk.channelId) {
+      window.__uploadedResult = true;
+      try {
+        window.drawShareCard().toBlob(async blob => {
+          if (!blob) return;
+          const formData = new FormData();
+          formData.append('image', blob, 'result.png');
+          formData.append('channel_id', window.discordSdk.channelId);
+          await fetch('/fourbythree/api/result', { method: 'POST', body: formData });
+        });
+      } catch (e) { console.error('Upload failed', e); }
+    }
+  };
+}
 </script>`, clientID)
 
 	// Reverse proxy to hankgreen.com.
@@ -205,12 +309,128 @@ if (inDiscord) {
 
 	mux := http.NewServeMux()
 
+	mux.HandleFunc("/discord/interactions", func(w http.ResponseWriter, r *http.Request) {
+		if pubKey == nil {
+			http.Error(w, "Bot not configured", 500)
+			return
+		}
+		body, ok := verifyInteraction(r, pubKey)
+		if !ok {
+			http.Error(w, "invalid request signature", 401)
+			return
+		}
+
+		var req struct {
+			Type int `json:"type"`
+			Data struct {
+				Name     string `json:"name"`
+				CustomID string `json:"custom_id"`
+			} `json:"data"`
+			Message *struct {
+				ID string `json:"id"`
+			} `json:"message"`
+			ChannelID string `json:"channel_id"`
+		}
+		if err := json.Unmarshal(body, &req); err != nil {
+			http.Error(w, "bad request", 400)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+
+		if req.Type == 1 { // PING
+			w.Write([]byte(`{"type": 1}`))
+			return
+		}
+
+		if req.Type == 2 && req.Data.Name == "play4x3" { // SLASH COMMAND
+			resp := map[string]interface{}{
+				"type": 4, // ChannelMessageWithSource
+				"data": map[string]interface{}{
+					"content": "Time to play 4×3!",
+					"components": []map[string]interface{}{
+						{
+							"type": 1, // ActionRow
+							"components": []map[string]interface{}{
+								{
+									"type":      2, // Button
+									"style":     1, // Primary
+									"label":     "Play Now",
+									"custom_id": "launch_4x3",
+								},
+							},
+						},
+					},
+				},
+			}
+			json.NewEncoder(w).Encode(resp)
+			return
+		}
+
+		if req.Type == 3 && req.Data.CustomID == "launch_4x3" { // BUTTON CLICK
+			if req.Message != nil && req.ChannelID != "" {
+				activeGames.Lock()
+				activeGames.m[req.ChannelID] = req.Message.ID
+				activeGames.Unlock()
+			}
+			w.Write([]byte(`{"type": 12}`))
+			return
+		}
+
+		w.Write([]byte(`{"type": 4, "data": {"content": "Unknown interaction"}}`))
+	})
+
+	mux.HandleFunc("/fourbythree/api/result", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			http.Error(w, "POST required", 405)
+			return
+		}
+
+		err := r.ParseMultipartForm(10 << 20) // 10 MB
+		if err != nil {
+			http.Error(w, "bad form", 400)
+			return
+		}
+
+		channelID := r.FormValue("channel_id")
+		file, _, err := r.FormFile("image")
+		if err != nil || channelID == "" {
+			http.Error(w, "missing fields", 400)
+			return
+		}
+		defer file.Close()
+
+		imgBlob, err := io.ReadAll(file)
+		if err != nil {
+			http.Error(w, "read error", 500)
+			return
+		}
+
+		activeGames.RLock()
+		msgID := activeGames.m[channelID]
+		activeGames.RUnlock()
+
+		if msgID == "" {
+			http.Error(w, "no active game found", 404)
+			return
+		}
+
+		if botToken != "" {
+			go func() {
+				if err := updateMessageWithImage(channelID, msgID, botToken, imgBlob); err != nil {
+					log.Printf("Failed to update message: %v", err)
+				}
+			}()
+		}
+		w.WriteHeader(200)
+	})
+
 	// Serve the Discord SDK and other static assets from client/static/.
 	staticFS, err := fs.Sub(staticFiles, "client/static")
 	if err != nil {
 		log.Fatalf("static fs error: %v", err)
 	}
-	mux.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.FS(staticFS))))
+	mux.Handle("/fourbythree/static/", http.StripPrefix("/fourbythree/static/", http.FileServer(http.FS(staticFS))))
 
 	// proxyHandler strips a path prefix then forwards to hankgreen.com.
 	proxyHandler := func(stripPrefix string) http.HandlerFunc {
