@@ -1,16 +1,38 @@
 package main
 
 import (
+	"crypto/tls"
 	"embed"
 	"fmt"
+	"io/fs"
 	"log"
 	"net/http"
-	"io/fs"
 	"net/http/httputil"
 	"net/url"
 	"os"
 	"strings"
+	"time"
 )
+
+// upstreamTransport is used for all requests to hankgreen.com.
+//
+// HTTP/2 is deliberately disabled. hankgreen.com (Vercel) uses HTTP/2
+// multiplexing: all requests share one connection. The Next.js streaming
+// HTML response keeps a stream open for 60 s+; if our proxy is slow to
+// drain it (due to NGINX backpressure), Go's HTTP/2 stack stops updating
+// the connection-level receive window, stalling every other stream on that
+// connection — including image requests like fishtrans.png.
+//
+// Forcing HTTP/1.1 gives each proxied request its own TCP connection so
+// one slow stream can never block another.
+var upstreamTransport http.RoundTripper = &http.Transport{
+	TLSNextProto:          make(map[string]func(string, *tls.Conn) http.RoundTripper),
+	MaxIdleConns:          100,
+	MaxIdleConnsPerHost:   10,
+	IdleConnTimeout:       90 * time.Second,
+	TLSHandshakeTimeout:   10 * time.Second,
+	ExpectContinueTimeout: 1 * time.Second,
+}
 
 // followRedirectsTransport follows HTTP redirects internally so 3xx responses
 // from Vercel/hankgreen are never forwarded to the browser.
@@ -26,7 +48,7 @@ func (followRedirectsTransport) RoundTrip(req *http.Request) (*http.Response, er
 	// rejects on outgoing requests. Clear it before the first hop.
 	req.RequestURI = ""
 
-	resp, err := http.DefaultTransport.RoundTrip(req)
+	resp, err := upstreamTransport.RoundTrip(req)
 	if err != nil {
 		return nil, err
 	}
@@ -44,7 +66,7 @@ func (followRedirectsTransport) RoundTrip(req *http.Request) (*http.Response, er
 		next.URL = loc
 		next.Host = loc.Host
 		next.RequestURI = ""
-		resp, err = http.DefaultTransport.RoundTrip(next)
+		resp, err = upstreamTransport.RoundTrip(next)
 		if err != nil {
 			return nil, err
 		}

@@ -87,10 +87,16 @@
       console.log('[4x3] Running outside Discord — SDK not initialised');
     }
 
-    // Hide the loading overlay once the iframe has loaded.
+    // Hide the loading overlay once the iframe signals load, OR after a
+    // short timeout — whichever comes first. hankgreen.com uses Next.js
+    // streaming (chunked), so the iframe `load` event can be delayed 60s+
+    // while React finishes deferred Suspense boundaries. The game grid itself
+    // renders in well under 2.5 s.
     const frame = document.getElementById('game-frame');
     const loading = document.getElementById('loading');
-    frame.addEventListener('load', () => loading.classList.add('hidden'));
+    const hideOverlay = () => loading.classList.add('hidden');
+    frame.addEventListener('load', hideOverlay);
+    setTimeout(hideOverlay, 2500);
   </script>
 </body>
 </html>

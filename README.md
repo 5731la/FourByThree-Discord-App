@@ -66,6 +66,20 @@ Open [http://localhost:3000](http://localhost:3000) — the game loads directly 
 
 In any voice channel → **Start Activity** → select **4×3**
 
+## Production (NGINX)
+
+hankgreen.com uses Next.js streaming (chunked transfer encoding). Without the right NGINX directives, the proxy buffers the response and the client waits 60 s+ for the stream to close. Use this config:
+
+```nginx
+location / {
+    proxy_pass http://localhost:4343;
+    proxy_http_version 1.1;       # required for chunked encoding
+    proxy_set_header Connection ""; # enable keep-alive to upstream
+    proxy_set_header Host $host;
+    proxy_buffering off;           # stream chunks immediately to the client
+}
+```
+
 
 ## Environment Variables
 
