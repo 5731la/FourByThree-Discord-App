@@ -12,9 +12,16 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 )
+
+// cspMetaRe matches a <meta http-equiv="Content-Security-Policy" ...> tag.
+// Next.js 13+ embeds the CSP in both a response header and this meta tag;
+// we strip the header in ModifyResponse but must also remove the meta tag
+// so its nonce-based policy does not block inline event handlers in the game.
+var cspMetaRe = regexp.MustCompile(`(?i)<meta[^>]+http-equiv=["']?Content-Security-Policy["']?[^>]*/?>`)
 
 // upstreamTransport is used for all requests to hankgreen.com.
 //
@@ -144,6 +151,10 @@ if (inDiscord) {
 				return err
 			}
 			modified := bytes.Replace(body, []byte("</body>"), []byte(discordSDKScript+"\n</body>"), 1)
+			// Also strip any CSP meta tag — Next.js embeds the policy in the
+			// HTML body as well as the header, and its nonce blocks the game's
+			// own inline event handlers when served inside Discord's iframe.
+			modified = cspMetaRe.ReplaceAll(modified, nil)
 			resp.Body = io.NopCloser(bytes.NewReader(modified))
 			resp.ContentLength = int64(len(modified))
 			resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(modified)))
