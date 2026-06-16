@@ -181,15 +181,22 @@ if (inDiscord) {
 	// /_next/* — Next.js static bundles (JS, CSS) referenced by absolute path in the HTML.
 	mux.HandleFunc("/_next/", proxyHandler(""))
 
-	// / — redirect to the game's canonical path so Discord Activity URL "/" works.
+	// / — redirect root to the game's canonical path.
+	// Catch-all: the game JS fetches assets with root-relative paths like
+	// /puzzles.json and /fishtrans.png. In Discord's proxy these arrive here
+	// without the /fourbythree prefix, so we prepend it before forwarding.
+	// Explicit handlers above (/fourbythree/, /_next/, /static/) take priority.
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" {
 			http.Redirect(w, r, "/fourbythree", http.StatusFound)
 			return
 		}
-		// Catch-all: proxy everything else to hankgreen.com as-is.
+		r.URL.Path = "/fourbythree" + r.URL.Path
+		if r.URL.RawPath != "" {
+			r.URL.RawPath = "/fourbythree" + r.URL.RawPath
+		}
 		r.Host = ""
-		log.Printf("[proxy] → https://www.hankgreen.com%s (catch-all)", r.URL.Path)
+		log.Printf("[proxy] → https://www.hankgreen.com%s (prepended /fourbythree)", r.URL.Path)
 		proxy.ServeHTTP(w, r)
 	})
 
