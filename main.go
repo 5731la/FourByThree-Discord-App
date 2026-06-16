@@ -117,11 +117,16 @@ func isRedirect(status int) bool {
 //go:embed all:client/static
 var staticFiles embed.FS
 
-// activeGames maps a Discord channel ID to the most recent invitation message ID
+// activeGames maps a Discord channel ID to the interaction session
+type GameSession struct {
+	AppID string
+	Token string
+}
+
 var activeGames = struct {
 	sync.RWMutex
-	m map[string]string
-}{m: make(map[string]string)}
+	m map[string]GameSession
+}{m: make(map[string]GameSession)}
 
 func verifyInteraction(r *http.Request, pubKey ed25519.PublicKey) ([]byte, bool) {
 	sigHex := r.Header.Get("X-Signature-Ed25519")
@@ -144,8 +149,8 @@ func verifyInteraction(r *http.Request, pubKey ed25519.PublicKey) ([]byte, bool)
 	return body, ed25519.Verify(pubKey, msg, sig)
 }
 
-func updateMessageWithImage(channelID, messageID, token string, imgBlob []byte) error {
-	url := fmt.Sprintf("https://discord.com/api/v10/channels/%s/messages/%s", channelID, messageID)
+func updateMessageWithImage(appID, token string, imgBlob []byte) error {
+	url := fmt.Sprintf("https://discord.com/api/v10/webhooks/%s/%s/messages/@original", appID, token)
 
 	body := &bytes.Buffer{}
 	writer := multipart.NewWriter(body)
@@ -164,7 +169,6 @@ func updateMessageWithImage(channelID, messageID, token string, imgBlob []byte) 
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bot "+token)
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 
 	client := &http.Client{Timeout: 10 * time.Second}
@@ -196,7 +200,6 @@ func main() {
 		b, _ := hex.DecodeString(pubKeyHex)
 		pubKey = ed25519.PublicKey(b)
 	}
-	botToken := os.Getenv("DISCORD_BOT_TOKEN")
 
 	// discordSDKScript is injected into every HTML page served from hankgreen.com.
 	// 1. Initialises the Discord Embedded App SDK if running inside an Activity.
@@ -253,7 +256,7 @@ if (typeof originalShowEnd === 'function') {
           const formData = new FormData();
           formData.append('image', blob, 'result.png');
           formData.append('channel_id', window.discordSdk.channelId);
-          await fetch('/fourbythree/api/result', { method: 'POST', body: formData });
+          await fetch('api/result', { method: 'POST', body: formData });
         });
       } catch (e) { console.error('Upload failed', e); }
     }
@@ -321,14 +324,13 @@ if (typeof originalShowEnd === 'function') {
 		}
 
 		var req struct {
-			Type int `json:"type"`
-			Data struct {
+			Type          int    `json:"type"`
+			Token         string `json:"token"`
+			ApplicationID string `json:"application_id"`
+			Data          struct {
 				Name     string `json:"name"`
 				CustomID string `json:"custom_id"`
 			} `json:"data"`
-			Message *struct {
-				ID string `json:"id"`
-			} `json:"message"`
 			ChannelID string `json:"channel_id"`
 		}
 		if err := json.Unmarshal(body, &req); err != nil {
@@ -368,9 +370,12 @@ if (typeof originalShowEnd === 'function') {
 		}
 
 		if req.Type == 3 && req.Data.CustomID == "launch_4x3" { // BUTTON CLICK
-			if req.Message != nil && req.ChannelID != "" {
+			if req.ChannelID != "" && req.Token != "" && req.ApplicationID != "" {
 				activeGames.Lock()
-				activeGames.m[req.ChannelID] = req.Message.ID
+				activeGames.m[req.ChannelID] = GameSession{
+					AppID: req.ApplicationID,
+					Token: req.Token,
+				}
 				activeGames.Unlock()
 			}
 			w.Write([]byte(`{"type": 12}`))
@@ -407,21 +412,19 @@ if (typeof originalShowEnd === 'function') {
 		}
 
 		activeGames.RLock()
-		msgID := activeGames.m[channelID]
+		session := activeGames.m[channelID]
 		activeGames.RUnlock()
 
-		if msgID == "" {
+		if session.Token == "" {
 			http.Error(w, "no active game found", 404)
 			return
 		}
 
-		if botToken != "" {
-			go func() {
-				if err := updateMessageWithImage(channelID, msgID, botToken, imgBlob); err != nil {
-					log.Printf("Failed to update message: %v", err)
-				}
-			}()
-		}
+		go func() {
+			if err := updateMessageWithImage(session.AppID, session.Token, imgBlob); err != nil {
+				log.Printf("Failed to update message: %v", err)
+			}
+		}()
 		w.WriteHeader(200)
 	})
 
