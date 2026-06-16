@@ -273,8 +273,8 @@ if (inDiscord) {
 // Auto-post image on finish
 const originalShowEnd = showResult;
 if (typeof originalShowEnd === 'function') {
-  showResult = function(fancy) {
-    originalShowEnd(fancy);
+  showResult = function(won, score, fancy, quiet) {
+    originalShowEnd(won, score, fancy, quiet);
     if (!window.__uploadedResult && inDiscord && authenticatedUserId) {
       window.__uploadedResult = true;
       try {
