@@ -63,6 +63,13 @@ func (followRedirectsTransport) RoundTrip(req *http.Request) (*http.Response, er
 	// rejects on outgoing requests. Clear it before the first hop.
 	req.RequestURI = ""
 
+	// Force uncompressed responses from hankgreen.com so our ModifyResponse
+	// can process HTML bodies (inject SDK script, strip CSP meta tag) as
+	// plain text. Discord's proxy sends Accept-Encoding: gzip, which without
+	// this would cause Vercel to return a gzipped response that bypasses our
+	// regex rewrites.
+	req.Header.Set("Accept-Encoding", "identity")
+
 	resp, err := upstreamTransport.RoundTrip(req)
 	if err != nil {
 		return nil, err
@@ -210,7 +217,7 @@ if (inDiscord) {
 	if err != nil {
 		log.Fatalf("static fs error: %v", err)
 	}
-	mux.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.FS(staticFS))))
+	mux.Handle("/fourbythree/static/", http.StripPrefix("/fourbythree/static/", http.FileServer(http.FS(staticFS))))
 
 	// proxyHandler strips a path prefix then forwards to hankgreen.com.
 	proxyHandler := func(stripPrefix string) http.HandlerFunc {
