@@ -149,7 +149,7 @@ func verifyInteraction(r *http.Request, pubKey ed25519.PublicKey) ([]byte, bool)
 	return body, ed25519.Verify(pubKey, msg, sig)
 }
 
-func createFollowupMessage(appID, token string, imgBlob []byte) error {
+func createFollowupMessage(appID, token, userID string, imgBlob []byte) error {
 	url := fmt.Sprintf("https://discord.com/api/v10/webhooks/%s/%s", appID, token)
 
 	body := &bytes.Buffer{}
@@ -161,7 +161,7 @@ func createFollowupMessage(appID, token string, imgBlob []byte) error {
 	}
 	part.Write(imgBlob)
 
-	payload := `{"content": "A player finished their 4×3 game!"}`
+	payload := fmt.Sprintf(`{"content": "<@%s> finished their 4×3 game!"}`, userID)
 	_ = writer.WriteField("payload_json", payload)
 	writer.Close()
 
@@ -200,6 +200,7 @@ func main() {
 		b, _ := hex.DecodeString(pubKeyHex)
 		pubKey = ed25519.PublicKey(b)
 	}
+	clientSecret := os.Getenv("DISCORD_CLIENT_SECRET")
 
 	// discordSDKScript is injected into every HTML page served from hankgreen.com.
 	// 1. Initialises the Discord Embedded App SDK if running inside an Activity.
@@ -208,12 +209,38 @@ func main() {
 	//    us to bind the rewritten data-on* attributes using new Function().
 	discordSDKScript := fmt.Sprintf(`<script type="module">
 const inDiscord = new URLSearchParams(window.location.search).has('frame_id');
+let authenticatedUserId = null;
+
 if (inDiscord) {
   const { DiscordSDK } = await import('/static/index.mjs');
   const sdk = new DiscordSDK(%q);
   window.discordSdk = sdk;
   await sdk.ready();
   console.log('[4x3] Discord SDK ready');
+
+  try {
+    const { code } = await sdk.commands.authorize({
+      client_id: %q,
+      response_type: 'code',
+      prompt: 'none',
+      scope: ['identify']
+    });
+    
+    const tokenResp = await fetch('api/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code })
+    });
+    const tokenData = await tokenResp.json();
+    
+    const auth = await sdk.commands.authenticate({
+      access_token: tokenData.access_token
+    });
+    authenticatedUserId = auth.user.id;
+    console.log('[4x3] Authenticated user', authenticatedUserId);
+  } catch(e) {
+    console.error('[4x3] Auth failed', e);
+  }
 } else {
   console.log('[4x3] Running outside Discord');
 }
@@ -248,21 +275,21 @@ const originalShowEnd = showResult;
 if (typeof originalShowEnd === 'function') {
   showResult = function(fancy) {
     originalShowEnd(fancy);
-    if (!window.__uploadedResult && inDiscord && window.discordSdk && window.discordSdk.channelId) {
+    if (!window.__uploadedResult && inDiscord && authenticatedUserId) {
       window.__uploadedResult = true;
       try {
         window.drawShareCard().toBlob(async blob => {
           if (!blob) return;
           const formData = new FormData();
           formData.append('image', blob, 'result.png');
-          formData.append('channel_id', window.discordSdk.channelId);
+          formData.append('user_id', authenticatedUserId);
           await fetch('api/result', { method: 'POST', body: formData });
         });
       } catch (e) { console.error('Upload failed', e); }
     }
   };
 }
-</script>`, clientID)
+</script>`, clientID, clientID)
 
 	// Reverse proxy to hankgreen.com.
 	// All game paths are forwarded directly — no nested iframe — so that
@@ -331,6 +358,14 @@ if (typeof originalShowEnd === 'function') {
 				Name     string `json:"name"`
 				CustomID string `json:"custom_id"`
 			} `json:"data"`
+			Member *struct {
+				User struct {
+					ID string `json:"id"`
+				} `json:"user"`
+			} `json:"member"`
+			User *struct {
+				ID string `json:"id"`
+			} `json:"user"`
 			ChannelID string `json:"channel_id"`
 		}
 		if err := json.Unmarshal(body, &req); err != nil {
@@ -370,9 +405,16 @@ if (typeof originalShowEnd === 'function') {
 		}
 
 		if req.Type == 3 && req.Data.CustomID == "launch_4x3" { // BUTTON CLICK
-			if req.ChannelID != "" && req.Token != "" && req.ApplicationID != "" {
+			var interactionUserID string
+			if req.Member != nil {
+				interactionUserID = req.Member.User.ID
+			} else if req.User != nil {
+				interactionUserID = req.User.ID
+			}
+
+			if interactionUserID != "" && req.Token != "" && req.ApplicationID != "" {
 				activeGames.Lock()
-				activeGames.m[req.ChannelID] = GameSession{
+				activeGames.m[interactionUserID] = GameSession{
 					AppID: req.ApplicationID,
 					Token: req.Token,
 				}
@@ -383,6 +425,45 @@ if (typeof originalShowEnd === 'function') {
 		}
 
 		w.Write([]byte(`{"type": 4, "data": {"content": "Unknown interaction"}}`))
+	})
+
+	mux.HandleFunc("/fourbythree/api/token", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			http.Error(w, "POST required", 405)
+			return
+		}
+		var reqBody struct {
+			Code string `json:"code"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
+			http.Error(w, "bad request", 400)
+			return
+		}
+
+		data := url.Values{}
+		data.Set("client_id", clientID)
+		data.Set("client_secret", clientSecret)
+		data.Set("grant_type", "authorization_code")
+		data.Set("code", reqBody.Code)
+
+		req, err := http.NewRequest("POST", "https://discord.com/api/v10/oauth2/token", strings.NewReader(data.Encode()))
+		if err != nil {
+			http.Error(w, "internal error", 500)
+			return
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+		client := &http.Client{Timeout: 10 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			http.Error(w, "upstream error", 502)
+			return
+		}
+		defer resp.Body.Close()
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(resp.StatusCode)
+		io.Copy(w, resp.Body)
 	})
 
 	mux.HandleFunc("/fourbythree/api/result", func(w http.ResponseWriter, r *http.Request) {
@@ -397,9 +478,9 @@ if (typeof originalShowEnd === 'function') {
 			return
 		}
 
-		channelID := r.FormValue("channel_id")
+		userID := r.FormValue("user_id")
 		file, _, err := r.FormFile("image")
-		if err != nil || channelID == "" {
+		if err != nil || userID == "" {
 			http.Error(w, "missing fields", 400)
 			return
 		}
@@ -412,7 +493,7 @@ if (typeof originalShowEnd === 'function') {
 		}
 
 		activeGames.RLock()
-		session := activeGames.m[channelID]
+		session := activeGames.m[userID]
 		activeGames.RUnlock()
 
 		if session.Token == "" {
@@ -421,7 +502,7 @@ if (typeof originalShowEnd === 'function') {
 		}
 
 		go func() {
-			if err := createFollowupMessage(session.AppID, session.Token, imgBlob); err != nil {
+			if err := createFollowupMessage(session.AppID, session.Token, userID, imgBlob); err != nil {
 				log.Printf("Failed to create followup message: %v", err)
 			}
 		}()
