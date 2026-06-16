@@ -69,32 +69,28 @@
   ></iframe>
 
   <script type="module">
-    // Initialise the Discord Embedded App SDK.
-    // We only need ready() — no OAuth required since the game doesn't use Discord identity.
-    // Discord Embedded App SDK is served locally to avoid CDN CORS/MIME issues.
-    import { DiscordSDK } from '/static/index.mjs';
+    // Discord injects a `frame_id` query parameter into the Activity URL.
+    // Only initialise the SDK when that param is present — skipping it entirely
+    // in local dev avoids the noisy "frame_id query param is not defined" error.
+    const inDiscord = new URLSearchParams(window.location.search).has('frame_id');
 
-    // DISCORD_CLIENT_ID is injected by the Go server at request time.
-    const clientId = window.__DISCORD_CLIENT_ID__;
+    if (inDiscord) {
+      // DISCORD_CLIENT_ID is injected by the Go server at request time.
+      const clientId = window.__DISCORD_CLIENT_ID__;
 
-    async function initDiscord() {
-      try {
-        const sdk = new DiscordSDK(clientId);
-        await sdk.ready();
-        console.log('[4x3] Discord SDK ready');
-      } catch (err) {
-        // Outside Discord (local dev) — sdk.ready() will time out or throw. That's fine.
-        console.warn('[4x3] Discord SDK not available (local dev mode):', err.message);
-      }
+      // Discord Embedded App SDK is served locally to avoid CDN CORS/MIME issues.
+      const { DiscordSDK } = await import('/static/index.mjs');
+      const sdk = new DiscordSDK(clientId);
+      await sdk.ready();
+      console.log('[4x3] Discord SDK ready');
+    } else {
+      console.log('[4x3] Running outside Discord — SDK not initialised');
     }
 
     // Hide the loading overlay once the iframe has loaded.
     const frame = document.getElementById('game-frame');
     const loading = document.getElementById('loading');
     frame.addEventListener('load', () => loading.classList.add('hidden'));
-
-    // Start Discord SDK init in parallel with iframe load.
-    initDiscord();
   </script>
 </body>
 </html>
