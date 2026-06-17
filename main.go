@@ -257,6 +257,13 @@ if (inDiscord) {
     });
     authenticatedUserId = auth.user.id;
     console.log('[4x3] Authenticated user', authenticatedUserId);
+
+    const statusRes = await fetch('api/status?user_id=' + authenticatedUserId);
+    if (!statusRes.ok) {
+      if (typeof window.toast === 'function') {
+        window.toast("Start the game with /play4x3 to auto-share your score!", 5000);
+      }
+    }
   } catch(e) {
     console.error('[4x3] Auth failed', e);
   }
@@ -302,8 +309,20 @@ if (typeof originalShowEnd === 'function') {
           const formData = new FormData();
           formData.append('image', blob, 'result.png');
           formData.append('user_id', authenticatedUserId);
+          if (window.discordSdk && window.discordSdk.channelId) {
+            formData.append('channel_id', window.discordSdk.channelId);
+          }
           try { formData.append('text_result', window.resultDescription()); } catch(err) {}
-          await fetch('api/result', { method: 'POST', body: formData });
+          const res = await fetch('api/result', { method: 'POST', body: formData });
+          if (!res.ok) {
+            if (typeof window.toast === 'function') {
+              window.toast("Start game with /play4x3 to auto-share!", 4000);
+            }
+          } else {
+            if (typeof window.toast === 'function') {
+              window.toast("Score shared to chat!", 3000);
+            }
+          }
         });
       } catch (e) { console.error('Upload failed', e); }
     }
@@ -487,6 +506,24 @@ if (typeof originalShowEnd === 'function') {
 		io.Copy(w, resp.Body)
 	})
 
+	mux.HandleFunc("/fourbythree/api/status", func(w http.ResponseWriter, r *http.Request) {
+		userID := r.URL.Query().Get("user_id")
+		if userID == "" {
+			http.Error(w, "missing user_id", 400)
+			return
+		}
+
+		activeGames.RLock()
+		session := activeGames.m[userID]
+		activeGames.RUnlock()
+
+		if session.Token == "" {
+			http.Error(w, "no active game found", 404)
+			return
+		}
+		w.WriteHeader(200)
+	})
+
 	mux.HandleFunc("/fourbythree/api/result", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "POST" {
 			http.Error(w, "POST required", 405)
@@ -523,11 +560,11 @@ if (typeof originalShowEnd === 'function') {
 			return
 		}
 
-		go func() {
-			if err := createFollowupMessage(session.AppID, session.Token, userID, textResult, imgBlob); err != nil {
-				log.Printf("Failed to create followup message: %v", err)
-			}
-		}()
+		if err := createFollowupMessage(session.AppID, session.Token, userID, textResult, imgBlob); err != nil {
+			log.Printf("Failed to create followup message: %v", err)
+			http.Error(w, "failed to post", 500)
+			return
+		}
 		w.WriteHeader(200)
 	})
 
