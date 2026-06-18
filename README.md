@@ -63,17 +63,26 @@ rm discord-embedded-app-sdk-*.tgz
 You must tell Discord that your app responds to `/play4x3`. Run this from any terminal, replacing `YOUR_BOT_TOKEN` and `YOUR_CLIENT_ID`:
 
 ```bash
+source .env
 curl -X POST \
-  -H "Authorization: Bot YOUR_BOT_TOKEN" \
+  -H "Authorization: Bot $DISCORD_BOT_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
     "name": "play4x3",
     "description": "Start a game of 4x3 in this channel!",
-    "type": 1
+    "type": 1,
+    "options": [
+      {
+        "name": "link",
+        "description": "Optional custom puzzle link (e.g. https://www.hankgreen.com/fourbythree#b=...)",
+        "type": 3,
+        "required": false
+      }
+    ]
   }' \
-  https://discord.com/api/v10/applications/YOUR_CLIENT_ID/commands
+  "https://discord.com/api/v10/applications/$DISCORD_CLIENT_ID/commands"
 ```
-*(Note: You only need a Bot Token once to register the command. The proxy itself does NOT require a Bot Token to run!)*
+*(Note: You only need a Bot Token once to register the command. Add `export DISCORD_BOT_TOKEN=your_token_here` to your `.env` for this step — the running proxy itself does NOT require it!)*
 
 ### 5. Build and Run
 ```bash

@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"crypto/tls"
 	"embed"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -117,10 +118,11 @@ func isRedirect(status int) bool {
 //go:embed all:client/static
 var staticFiles embed.FS
 
-// activeGames maps a Discord channel ID to the interaction session
+// activeGames maps a Discord user ID to the interaction session
 type GameSession struct {
-	AppID string
-	Token string
+	AppID      string
+	Token      string
+	PuzzleLink string // optional hash fragment from a custom puzzle link
 }
 
 var activeGames = struct {
@@ -149,7 +151,7 @@ func verifyInteraction(r *http.Request, pubKey ed25519.PublicKey) ([]byte, bool)
 	return body, ed25519.Verify(pubKey, msg, sig)
 }
 
-func createFollowupMessage(appID, token, userID, textResult string, imgBlob []byte) error {
+func createFollowupMessage(appID, token, userID, textResult, puzzleLink string, imgBlob []byte) error {
 	url := fmt.Sprintf("https://discord.com/api/v10/webhooks/%s/%s", appID, token)
 
 	body := &bytes.Buffer{}
@@ -168,7 +170,13 @@ func createFollowupMessage(appID, token, userID, textResult string, imgBlob []by
 			Description string `json:"description"`
 		} `json:"attachments"`
 	}{
-		Content: fmt.Sprintf("<@%s> finished their 4×3 game!", userID),
+		Content: func() string {
+			s := fmt.Sprintf("<@%s> finished their 4\u00d73 game!", userID)
+			if puzzleLink != "" {
+				s += fmt.Sprintf(" [View puzzle](%s)", puzzleLink)
+			}
+			return s
+		}(),
 		Attachments: []struct {
 			ID          int    `json:"id"`
 			Description string `json:"description"`
@@ -263,6 +271,18 @@ if (inDiscord) {
       if (typeof window.toast === 'function') {
         window.toast("Start the game with /play4x3 to auto-share your score!", 5000);
       }
+    } else {
+      const statusData = await statusRes.json();
+      if (statusData.puzzle_link) {
+        window.__puzzleLink = statusData.puzzle_link;
+        // Extract the hash fragment and navigate the game to it.
+        try {
+          const hashIdx = statusData.puzzle_link.indexOf('#');
+          if (hashIdx !== -1) {
+            window.location.hash = statusData.puzzle_link.slice(hashIdx + 1);
+          }
+        } catch(e) { console.error('[4x3] Failed to apply puzzle hash', e); }
+      }
     }
   } catch(e) {
     console.error('[4x3] Auth failed', e);
@@ -313,6 +333,7 @@ if (typeof originalShowEnd === 'function') {
             formData.append('channel_id', window.discordSdk.channelId);
           }
           try { formData.append('text_result', window.resultDescription()); } catch(err) {}
+          if (window.__puzzleLink) { formData.append('puzzle_link', window.__puzzleLink); }
           const res = await fetch('api/result', { method: 'POST', body: formData });
           if (!res.ok) {
             if (typeof window.toast === 'function') {
@@ -396,6 +417,10 @@ if (typeof originalShowEnd === 'function') {
 			Data          struct {
 				Name     string `json:"name"`
 				CustomID string `json:"custom_id"`
+				Options  []struct {
+					Name  string `json:"name"`
+					Value string `json:"value"`
+				} `json:"options"`
 			} `json:"data"`
 			Member *struct {
 				User struct {
@@ -420,10 +445,35 @@ if (typeof originalShowEnd === 'function') {
 		}
 
 		if req.Type == 2 && req.Data.Name == "play4x3" { // SLASH COMMAND
+			// Extract optional custom puzzle link
+			var puzzleLink string
+			for _, opt := range req.Data.Options {
+				if opt.Name == "link" {
+					puzzleLink = opt.Value
+				}
+			}
+
+			// If there's a puzzle link extract just the hash fragment for embedding.
+			// Store the full URL for the followup message.
+			var content string
+			if puzzleLink != "" {
+				content = fmt.Sprintf("Time to play a custom 4×3 puzzle! [Open puzzle](%s)", puzzleLink)
+			} else {
+				content = "Time to play 4×3!"
+			}
+
+			// Embed the puzzle link as a base64 JSON blob in the button custom_id so
+			// it survives to the BUTTON_CLICK interaction without server-side state.
+			customID := "launch_4x3"
+			if puzzleLink != "" {
+				encoded := base64.StdEncoding.EncodeToString([]byte(puzzleLink))
+				customID = "launch_4x3:" + encoded
+			}
+
 			resp := map[string]interface{}{
 				"type": 4, // ChannelMessageWithSource
 				"data": map[string]interface{}{
-					"content": "Time to play 4×3!",
+					"content": content,
 					"components": []map[string]interface{}{
 						{
 							"type": 1, // ActionRow
@@ -432,7 +482,7 @@ if (typeof originalShowEnd === 'function') {
 									"type":      2, // Button
 									"style":     1, // Primary
 									"label":     "Play Now",
-									"custom_id": "launch_4x3",
+									"custom_id": customID,
 								},
 							},
 						},
@@ -443,7 +493,7 @@ if (typeof originalShowEnd === 'function') {
 			return
 		}
 
-		if req.Type == 3 && req.Data.CustomID == "launch_4x3" { // BUTTON CLICK
+		if req.Type == 3 && strings.HasPrefix(req.Data.CustomID, "launch_4x3") { // BUTTON CLICK
 			var interactionUserID string
 			if req.Member != nil {
 				interactionUserID = req.Member.User.ID
@@ -451,11 +501,20 @@ if (typeof originalShowEnd === 'function') {
 				interactionUserID = req.User.ID
 			}
 
+			// Decode optional puzzle link from custom_id suffix "launch_4x3:<base64>"
+			var puzzleLink string
+			if parts := strings.SplitN(req.Data.CustomID, ":", 2); len(parts) == 2 {
+				if decoded, err := base64.StdEncoding.DecodeString(parts[1]); err == nil {
+					puzzleLink = string(decoded)
+				}
+			}
+
 			if interactionUserID != "" && req.Token != "" && req.ApplicationID != "" {
 				activeGames.Lock()
 				activeGames.m[interactionUserID] = GameSession{
-					AppID: req.ApplicationID,
-					Token: req.Token,
+					AppID:      req.ApplicationID,
+					Token:      req.Token,
+					PuzzleLink: puzzleLink,
 				}
 				activeGames.Unlock()
 			}
@@ -521,7 +580,10 @@ if (typeof originalShowEnd === 'function') {
 			http.Error(w, "no active game found", 404)
 			return
 		}
-		w.WriteHeader(200)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"puzzle_link": session.PuzzleLink,
+		})
 	})
 
 	mux.HandleFunc("/fourbythree/api/result", func(w http.ResponseWriter, r *http.Request) {
@@ -538,6 +600,13 @@ if (typeof originalShowEnd === 'function') {
 
 		userID := r.FormValue("user_id")
 		textResult := r.FormValue("text_result")
+		puzzleLink := r.FormValue("puzzle_link")
+		// Fall back to puzzle link stored in session (set at button-click time)
+		if puzzleLink == "" {
+			activeGames.RLock()
+			puzzleLink = activeGames.m[userID].PuzzleLink
+			activeGames.RUnlock()
+		}
 		file, _, err := r.FormFile("image")
 		if err != nil || userID == "" {
 			http.Error(w, "missing fields", 400)
@@ -560,7 +629,7 @@ if (typeof originalShowEnd === 'function') {
 			return
 		}
 
-		if err := createFollowupMessage(session.AppID, session.Token, userID, textResult, imgBlob); err != nil {
+		if err := createFollowupMessage(session.AppID, session.Token, userID, textResult, puzzleLink, imgBlob); err != nil {
 			log.Printf("Failed to create followup message: %v", err)
 			http.Error(w, "failed to post", 500)
 			return
