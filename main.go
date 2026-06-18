@@ -5,7 +5,6 @@ import (
 	"crypto/ed25519"
 	"crypto/tls"
 	"embed"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -129,6 +128,12 @@ var activeGames = struct {
 	sync.RWMutex
 	m map[string]GameSession
 }{m: make(map[string]GameSession)}
+
+// pendingPuzzles maps a Discord channel_id to a puzzle link set by a slash command.
+var pendingPuzzles = struct {
+	sync.RWMutex
+	m map[string]string
+}{m: make(map[string]string)}
 
 func verifyInteraction(r *http.Request, pubKey ed25519.PublicKey) ([]byte, bool) {
 	sigHex := r.Header.Get("X-Signature-Ed25519")
@@ -411,6 +416,7 @@ if (typeof originalShowEnd === 'function') {
 		}
 
 		var req struct {
+			ID            string `json:"id"`
 			Type          int    `json:"type"`
 			Token         string `json:"token"`
 			ApplicationID string `json:"application_id"`
@@ -462,12 +468,14 @@ if (typeof originalShowEnd === 'function') {
 				content = "Time to play 4×3!"
 			}
 
-			// Embed the puzzle link as a base64 JSON blob in the button custom_id so
-			// it survives to the BUTTON_CLICK interaction without server-side state.
+			// Store the puzzle link keyed by this interaction's unique ID so that
+			// each button is independently tied to one specific puzzle.
 			customID := "launch_4x3"
-			if puzzleLink != "" {
-				encoded := base64.StdEncoding.EncodeToString([]byte(puzzleLink))
-				customID = "launch_4x3:" + encoded
+			if puzzleLink != "" && req.ID != "" {
+				pendingPuzzles.Lock()
+				pendingPuzzles.m[req.ID] = puzzleLink
+				pendingPuzzles.Unlock()
+				customID = "launch_4x3:" + req.ID
 			}
 
 			resp := map[string]interface{}{
@@ -501,12 +509,14 @@ if (typeof originalShowEnd === 'function') {
 				interactionUserID = req.User.ID
 			}
 
-			// Decode optional puzzle link from custom_id suffix "launch_4x3:<base64>"
+			// Retrieve any pending puzzle link that was set by the slash command.
+			// The custom_id is "launch_4x3" for daily puzzles, or
+			// "launch_4x3:<interactionID>" for custom puzzles.
 			var puzzleLink string
 			if parts := strings.SplitN(req.Data.CustomID, ":", 2); len(parts) == 2 {
-				if decoded, err := base64.StdEncoding.DecodeString(parts[1]); err == nil {
-					puzzleLink = string(decoded)
-				}
+				pendingPuzzles.RLock()
+				puzzleLink = pendingPuzzles.m[parts[1]]
+				pendingPuzzles.RUnlock()
 			}
 
 			if interactionUserID != "" && req.Token != "" && req.ApplicationID != "" {
