@@ -122,6 +122,7 @@ type GameSession struct {
 	AppID      string
 	Token      string
 	PuzzleLink string // optional hash fragment from a custom puzzle link
+	GameType   string // "4x3" or "smush"
 }
 
 var activeGames = struct {
@@ -278,6 +279,11 @@ if (inDiscord) {
       }
     } else {
       const statusData = await statusRes.json();
+      // If this session is for a different game, redirect there immediately.
+      if (statusData.game_type === 'smush' && !window.location.pathname.startsWith('/smush')) {
+        window.location.replace('/smush/' + window.location.search + window.location.hash);
+        return;
+      }
       if (statusData.puzzle_link) {
         window.__puzzleLink = statusData.puzzle_link;
         // Extract the hash fragment and navigate the game to it.
@@ -580,8 +586,20 @@ document.addEventListener('DOMContentLoaded', _smushWrap);
 			if interactionUserID != "" && req.Token != "" && req.ApplicationID != "" {
 				activeGames.Lock()
 				activeGames.m["smush:"+interactionUserID] = GameSession{
-					AppID: req.ApplicationID,
-					Token: req.Token,
+					AppID:    req.ApplicationID,
+					Token:    req.Token,
+					GameType: "smush",
+				}
+				activeGames.Unlock()
+			}
+			// Also store under bare user ID so the fourbythree status endpoint
+			// (which the injected script calls first) can detect game_type and redirect.
+			if interactionUserID != "" && req.Token != "" && req.ApplicationID != "" {
+				activeGames.Lock()
+				activeGames.m[interactionUserID] = GameSession{
+					AppID:    req.ApplicationID,
+					Token:    req.Token,
+					GameType: "smush",
 				}
 				activeGames.Unlock()
 			}
@@ -664,6 +682,7 @@ document.addEventListener('DOMContentLoaded', _smushWrap);
 					AppID:      req.ApplicationID,
 					Token:      req.Token,
 					PuzzleLink: puzzleLink,
+					GameType:   "4x3",
 				}
 				activeGames.Unlock()
 			}
@@ -732,6 +751,7 @@ document.addEventListener('DOMContentLoaded', _smushWrap);
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{
 			"puzzle_link": session.PuzzleLink,
+			"game_type":   session.GameType,
 		})
 	})
 
