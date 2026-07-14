@@ -942,6 +942,9 @@ document.addEventListener('DOMContentLoaded', _smushWrap);
 	}
 	mux.HandleFunc("/smush/", smushGameHandler)
 	mux.HandleFunc("/smush", smushGameHandler)
+	// Discord's portal prefixes every path with /fourbythree, so /smush/ arrives as /fourbythree/smush/
+	mux.HandleFunc("/fourbythree/smush/", smushGameHandler)
+	mux.HandleFunc("/fourbythree/smush", smushGameHandler)
 
 	// Serve the Discord SDK and other static assets from client/static/.
 	staticFS, err := fs.Sub(staticFiles, "client/static")
