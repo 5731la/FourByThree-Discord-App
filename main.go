@@ -834,16 +834,6 @@ document.addEventListener('DOMContentLoaded', _smushWrap);
 		return nil
 	}
 
-	smushProxyHandler := func(stripPrefix string) http.HandlerFunc {
-		return func(w http.ResponseWriter, r *http.Request) {
-			r.URL.Path = strings.TrimPrefix(r.URL.Path, stripPrefix)
-			r.URL.RawPath = strings.TrimPrefix(r.URL.RawPath, stripPrefix)
-			r.Host = ""
-			log.Printf("[smush-proxy] → https://www.hankgreen.com%s", r.URL.Path)
-			smushProxy.ServeHTTP(w, r)
-		}
-	}
-
 	mux.HandleFunc("/smush/api/token", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "POST" {
 			http.Error(w, "POST required", 405)
@@ -935,9 +925,23 @@ document.addEventListener('DOMContentLoaded', _smushWrap);
 		w.WriteHeader(200)
 	})
 
-	// /smush/* — proxy Smush game and its assets
-	mux.HandleFunc("/smush/", smushProxyHandler(""))
-	mux.HandleFunc("/smush", smushProxyHandler(""))
+	// /smush/* — proxy Smush game and its assets.
+	// Requests arrive as /smush/... or /fourbythree/smush/... (the catch-all
+	// prepends /fourbythree for asset requests); strip that before forwarding.
+	smushGameHandler := func(w http.ResponseWriter, r *http.Request) {
+		p := r.URL.Path
+		p = strings.TrimPrefix(p, "/fourbythree")
+		if !strings.HasPrefix(p, "/smush") {
+			p = "/smush" + p
+		}
+		r.URL.Path = p
+		r.URL.RawPath = ""
+		r.Host = ""
+		log.Printf("[smush-proxy] → https://www.hankgreen.com%s", r.URL.Path)
+		smushProxy.ServeHTTP(w, r)
+	}
+	mux.HandleFunc("/smush/", smushGameHandler)
+	mux.HandleFunc("/smush", smushGameHandler)
 
 	// Serve the Discord SDK and other static assets from client/static/.
 	staticFS, err := fs.Sub(staticFiles, "client/static")
