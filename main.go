@@ -356,6 +356,93 @@ if (typeof originalShowEnd === 'function') {
 }
 </script>`, clientID, clientID)
 
+	// smushSDKScript is injected into every Smush HTML page.
+	// Smush uses inline JS with gameOver() as the completion hook,
+	// drawShareCard() for the canvas image, and shareText() for the text summary.
+	smushSDKScript := fmt.Sprintf(`<script type="module">
+const inDiscord = new URLSearchParams(window.location.search).has('frame_id');
+let authenticatedUserId = null;
+
+if (inDiscord) {
+  const { DiscordSDK } = await import('/static/index.mjs');
+  const sdk = new DiscordSDK(%q);
+  window.discordSdk = sdk;
+  await sdk.ready();
+  console.log('[smush] Discord SDK ready');
+
+  try {
+    const { code } = await sdk.commands.authorize({
+      client_id: %q,
+      response_type: 'code',
+      prompt: 'none',
+      scope: ['identify']
+    });
+
+    const tokenResp = await fetch('api/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code })
+    });
+    const tokenData = await tokenResp.json();
+
+    const auth = await sdk.commands.authenticate({
+      access_token: tokenData.access_token
+    });
+    authenticatedUserId = auth.user.id;
+    console.log('[smush] Authenticated user', authenticatedUserId);
+
+    const statusRes = await fetch('api/status?user_id=' + authenticatedUserId);
+    if (!statusRes.ok) {
+      console.log('[smush] No active game session — start with /playsmush to auto-share');
+    }
+  } catch(e) {
+    console.error('[smush] Auth failed', e);
+  }
+} else {
+  console.log('[smush] Running outside Discord');
+}
+
+// Hook gameOver() — called by Smush when the puzzle is completed.
+const _smushUpload = async () => {
+  if (window.__smushUploaded || !inDiscord || !authenticatedUserId) return;
+  window.__smushUploaded = true;
+  try {
+    const canvas = typeof drawShareCard === 'function' ? drawShareCard() : null;
+    if (!canvas) { console.error('[smush] drawShareCard not available'); return; }
+    canvas.toBlob(async blob => {
+      if (!blob) return;
+      const formData = new FormData();
+      formData.append('image', blob, 'result.png');
+      formData.append('user_id', authenticatedUserId);
+      if (window.discordSdk && window.discordSdk.channelId) {
+        formData.append('channel_id', window.discordSdk.channelId);
+      }
+      try { formData.append('text_result', shareText ? shareText() : ''); } catch(e) {}
+      const res = await fetch('api/result', { method: 'POST', body: formData });
+      if (res.ok) {
+        console.log('[smush] Score shared to chat!');
+      } else {
+        console.warn('[smush] Share failed — start with /playsmush to enable auto-share');
+      }
+    });
+  } catch(e) { console.error('[smush] Upload failed', e); }
+};
+
+// Wrap gameOver so we can intercept it after the game defines it.
+// Smush defines gameOver inline, so we poll until it exists then wrap it.
+const _smushWrap = () => {
+  if (typeof gameOver !== 'function') { setTimeout(_smushWrap, 200); return; }
+  const _orig = gameOver;
+  gameOver = function(...args) {
+    const ret = _orig.apply(this, args);
+    _smushUpload();
+    return ret;
+  };
+  console.log('[smush] gameOver hooked');
+};
+document.addEventListener('DOMContentLoaded', _smushWrap);
+</script>`, clientID, clientID)
+
 	// Reverse proxy to hankgreen.com.
 	// All game paths are forwarded directly — no nested iframe — so that
 	// Next.js client-side routing works at the correct path (/fourbythree).
@@ -447,6 +534,58 @@ if (typeof originalShowEnd === 'function') {
 
 		if req.Type == 1 { // PING
 			w.Write([]byte(`{"type": 1}`))
+			return
+		}
+
+		if req.Type == 2 && req.Data.Name == "playsmush" { // SMUSH SLASH COMMAND
+			userID := ""
+			if req.Member != nil {
+				userID = req.Member.User.ID
+			} else if req.User != nil {
+				userID = req.User.ID
+			}
+			_ = userID
+
+			customID := "launch_smush"
+			resp := map[string]interface{}{
+				"type": 4,
+				"data": map[string]interface{}{
+					"content": "Time to play Smush!",
+					"components": []map[string]interface{}{
+						{
+							"type": 1,
+							"components": []map[string]interface{}{
+								{
+									"type":      2,
+									"style":     1,
+									"label":     "Play Now",
+									"custom_id": customID,
+								},
+							},
+						},
+					},
+				},
+			}
+			json.NewEncoder(w).Encode(resp)
+			return
+		}
+
+		if req.Type == 3 && req.Data.CustomID == "launch_smush" { // SMUSH BUTTON CLICK
+			var interactionUserID string
+			if req.Member != nil {
+				interactionUserID = req.Member.User.ID
+			} else if req.User != nil {
+				interactionUserID = req.User.ID
+			}
+			if interactionUserID != "" && req.Token != "" && req.ApplicationID != "" {
+				activeGames.Lock()
+				activeGames.m["smush:"+interactionUserID] = GameSession{
+					AppID: req.ApplicationID,
+					Token: req.Token,
+				}
+				activeGames.Unlock()
+			}
+			w.Write([]byte(`{"type": 12}`))
 			return
 		}
 
@@ -647,12 +786,149 @@ if (typeof originalShowEnd === 'function') {
 		w.WriteHeader(200)
 	})
 
+	// --- Smush API routes ---
+
+	// smushProxyModifyResponse wraps the proxy's ModifyResponse to inject the
+	// Smush SDK script instead of the 4x3 one for requests under /smush/.
+	smushProxy := httputil.NewSingleHostReverseProxy(target)
+	smushProxy.Transport = followRedirectsTransport{}
+	smushProxy.ModifyResponse = func(resp *http.Response) error {
+		log.Printf("[smush-proxy] upstream %s %s → %d", resp.Request.Method, resp.Request.URL, resp.StatusCode)
+		resp.Header.Del("X-Frame-Options")
+		resp.Header.Del("Content-Security-Policy")
+		resp.Header.Del("Content-Security-Policy-Report-Only")
+		resp.Header.Set("Access-Control-Allow-Origin", "*")
+		ct := resp.Header.Get("Content-Type")
+		if resp.StatusCode == http.StatusOK && strings.Contains(ct, "text/html") {
+			body, err := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if err != nil {
+				return err
+			}
+			modified := bytes.Replace(body, []byte("</body>"), []byte(smushSDKScript+"\n</body>"), 1)
+			modified = cspMetaRe.ReplaceAll(modified, nil)
+			modified = inlineEventsRe.ReplaceAll(modified, []byte(`data-$1=$2`))
+			resp.Body = io.NopCloser(bytes.NewReader(modified))
+			resp.ContentLength = int64(len(modified))
+			resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(modified)))
+			resp.Header.Del("Transfer-Encoding")
+		}
+		return nil
+	}
+
+	smushProxyHandler := func(stripPrefix string) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			r.URL.Path = strings.TrimPrefix(r.URL.Path, stripPrefix)
+			r.URL.RawPath = strings.TrimPrefix(r.URL.RawPath, stripPrefix)
+			r.Host = ""
+			log.Printf("[smush-proxy] → https://www.hankgreen.com%s", r.URL.Path)
+			smushProxy.ServeHTTP(w, r)
+		}
+	}
+
+	mux.HandleFunc("/smush/api/token", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			http.Error(w, "POST required", 405)
+			return
+		}
+		var reqBody struct {
+			Code string `json:"code"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
+			http.Error(w, "bad request", 400)
+			return
+		}
+		data := url.Values{}
+		data.Set("client_id", clientID)
+		data.Set("client_secret", clientSecret)
+		data.Set("grant_type", "authorization_code")
+		data.Set("code", reqBody.Code)
+		data.Set("redirect_uri", redirectURI)
+		req, err := http.NewRequest("POST", "https://discord.com/api/v10/oauth2/token", strings.NewReader(data.Encode()))
+		if err != nil {
+			http.Error(w, "internal error", 500)
+			return
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		client := &http.Client{Timeout: 10 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			http.Error(w, "upstream error", 502)
+			return
+		}
+		defer resp.Body.Close()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(resp.StatusCode)
+		io.Copy(w, resp.Body)
+	})
+
+	mux.HandleFunc("/smush/api/status", func(w http.ResponseWriter, r *http.Request) {
+		userID := r.URL.Query().Get("user_id")
+		if userID == "" {
+			http.Error(w, "missing user_id", 400)
+			return
+		}
+		activeGames.RLock()
+		session := activeGames.m["smush:"+userID]
+		activeGames.RUnlock()
+		if session.Token == "" {
+			http.Error(w, "no active game found", 404)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	})
+
+	mux.HandleFunc("/smush/api/result", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			http.Error(w, "POST required", 405)
+			return
+		}
+		if err := r.ParseMultipartForm(10 << 20); err != nil {
+			http.Error(w, "bad form", 400)
+			return
+		}
+		userID := r.FormValue("user_id")
+		textResult := r.FormValue("text_result")
+		file, _, err := r.FormFile("image")
+		if err != nil || userID == "" {
+			http.Error(w, "missing fields", 400)
+			return
+		}
+		defer file.Close()
+		imgBlob, err := io.ReadAll(file)
+		if err != nil {
+			http.Error(w, "read error", 500)
+			return
+		}
+		activeGames.RLock()
+		session := activeGames.m["smush:"+userID]
+		activeGames.RUnlock()
+		if session.Token == "" {
+			http.Error(w, "no active game found", 404)
+			return
+		}
+		content := fmt.Sprintf("<@%s> finished today's Smush!", userID)
+		if err := createFollowupMessage(session.AppID, session.Token, userID, textResult, "", imgBlob); err != nil {
+			log.Printf("[smush] Failed to post followup: %v (content would have been: %s)", err, content)
+			http.Error(w, "failed to post", 500)
+			return
+		}
+		w.WriteHeader(200)
+	})
+
+	// /smush/* — proxy Smush game and its assets
+	mux.HandleFunc("/smush/", smushProxyHandler(""))
+	mux.HandleFunc("/smush", smushProxyHandler(""))
+
 	// Serve the Discord SDK and other static assets from client/static/.
 	staticFS, err := fs.Sub(staticFiles, "client/static")
 	if err != nil {
 		log.Fatalf("static fs error: %v", err)
 	}
 	mux.Handle("/fourbythree/static/", http.StripPrefix("/fourbythree/static/", http.FileServer(http.FS(staticFS))))
+	// Smush also needs the Discord SDK — serve it under /smush/static/ too.
+	mux.Handle("/smush/static/", http.StripPrefix("/smush/static/", http.FileServer(http.FS(staticFS))))
 
 	// proxyHandler strips a path prefix then forwards to hankgreen.com.
 	proxyHandler := func(stripPrefix string) http.HandlerFunc {
