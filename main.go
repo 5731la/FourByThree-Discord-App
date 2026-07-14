@@ -282,9 +282,7 @@ if (inDiscord) {
       // If this session is for a different game, redirect there immediately.
       if (statusData.game_type === 'smush' && !window.location.pathname.startsWith('/smush')) {
         window.location.replace('/smush/' + window.location.search + window.location.hash);
-        return;
-      }
-      if (statusData.puzzle_link) {
+      } else if (statusData.puzzle_link) {
         window.__puzzleLink = statusData.puzzle_link;
         // Extract the hash fragment and navigate the game to it.
         try {
