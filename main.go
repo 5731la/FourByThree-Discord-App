@@ -28,11 +28,11 @@ import (
 // so its nonce-based policy does not block inline event handlers in the game.
 var cspMetaRe = regexp.MustCompile(`(?i)<meta[^>]+http-equiv=["']?Content-Security-Policy["']?[^>]*/?>`)
 
-// inlineEventsRe matches inline event handlers like onclick="...", onclick='...', or
-// onclick=()=>... (unquoted arrow functions) which Discord's CSP blocks by removing
-// 'unsafe-inline'. We rewrite them to data-* attributes and re-bind dynamically.
-// The alternation handles: quoted strings, or unquoted values up to the next whitespace/>
-var inlineEventsRe = regexp.MustCompile(`(?i)\b(on(?:click|keydown|input|error|load|change|submit))=(["'][^"']*["']|[^\s"'>]+)`)
+// inlineEventsRe matches quoted inline event handlers like onclick="..." or onclick='...'
+// which Discord's CSP blocks. We rewrite them to data-* attributes and re-bind dynamically.
+// NOTE: unquoted values (e.g. onclick=()=>fn()) are intentionally left alone because the
+// '>' in '=>' is indistinguishable from an HTML close-tag, so regex rewriting corrupts the JS.
+var inlineEventsRe = regexp.MustCompile(`(?i)\b(on(?:click|keydown|input|error|load|change|submit))=(["'][^"']*["'])`)
 
 // upstreamTransport is used for all requests to hankgreen.com.
 //
@@ -320,11 +320,12 @@ _patchHandlers();
 document.addEventListener('DOMContentLoaded', _patchHandlers);
 new MutationObserver(_patchHandlers).observe(document.documentElement, { childList: true, subtree: true });
 
-// Auto-post image on finish
-const originalShowEnd = showResult;
-if (typeof originalShowEnd === 'function') {
+// Auto-post image on finish — guard against showResult not yet defined (loaded async).
+const _hookShowResult = () => {
+  if (typeof showResult !== 'function') { setTimeout(_hookShowResult, 200); return; }
+  const _origShowResult = showResult;
   showResult = function(won, score, fancy, quiet) {
-    originalShowEnd(won, score, fancy, quiet);
+    _origShowResult(won, score, fancy, quiet);
     if (!window.__uploadedResult && inDiscord && authenticatedUserId) {
       window.__uploadedResult = true;
       try {
@@ -352,7 +353,8 @@ if (typeof originalShowEnd === 'function') {
       } catch (e) { console.error('Upload failed', e); }
     }
   };
-}
+};
+_hookShowResult();
 </script>`, clientID, clientID)
 
 	// smushSDKScript is injected into every Smush HTML page.
@@ -457,6 +459,26 @@ function _patchHandlers() {
 _patchHandlers();
 document.addEventListener('DOMContentLoaded', _patchHandlers);
 new MutationObserver(_patchHandlers).observe(document.documentElement, { childList: true, subtree: true });
+
+// Unquoted arrow function onclick=()=>fn() attrs survive the proxy rewrite (the regex can't
+// safely rewrite them). Discord's CSP blocks them, but the attribute is still in the DOM.
+// Re-bind them via addEventListener using eval-equivalent so they run in global scope.
+function _patchArrowOnclicks() {
+  document.querySelectorAll('[onclick]').forEach(el => {
+    if (el.__arrowPatched) return;
+    el.__arrowPatched = true;
+    const raw = el.getAttribute('onclick');
+    if (!raw) return;
+    el.removeAttribute('onclick');
+    el.addEventListener('click', function(event) {
+      try { (new Function('event', raw)).call(this, event); }
+      catch(e) { console.warn('[smush] arrow onclick error:', raw, e); }
+    });
+  });
+}
+_patchArrowOnclicks();
+document.addEventListener('DOMContentLoaded', _patchArrowOnclicks);
+new MutationObserver(_patchArrowOnclicks).observe(document.documentElement, { childList: true, subtree: true });
 </script>`, clientID, clientID)
 
 	// Reverse proxy to hankgreen.com.
