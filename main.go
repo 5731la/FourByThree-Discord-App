@@ -873,15 +873,25 @@ new MutationObserver(_patchArrowOnclicks).observe(document.documentElement, { ch
 		resp.Header.Del("Content-Security-Policy-Report-Only")
 		resp.Header.Set("Access-Control-Allow-Origin", "*")
 		ct := resp.Header.Get("Content-Type")
-		if resp.StatusCode == http.StatusOK && strings.Contains(ct, "text/html") {
+		isHTML := resp.StatusCode == http.StatusOK && strings.Contains(ct, "text/html")
+		isJS := resp.StatusCode == http.StatusOK && (strings.Contains(ct, "javascript") || strings.Contains(ct, "text/plain"))
+		if isHTML || isJS {
 			body, err := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			if err != nil {
 				return err
 			}
-			modified := bytes.Replace(body, []byte("</body>"), []byte(smushSDKScript+"\n</body>"), 1)
-			modified = cspMetaRe.ReplaceAll(modified, nil)
-			modified = inlineEventsRe.ReplaceAll(modified, []byte(`data-$1=$2`))
+			// Rewrite calls to the Cloudflare Worker stats API so they go through our proxy.
+			// This avoids CORS/CSP blocks inside Discord's iframe.
+			modified := bytes.ReplaceAll(body,
+				[]byte("https://fourbythree-stats.hankmt.workers.dev"),
+				[]byte("/fourbythree/smush/workerproxy"),
+			)
+			if isHTML {
+				modified = bytes.Replace(modified, []byte("</body>"), []byte(smushSDKScript+"\n</body>"), 1)
+				modified = cspMetaRe.ReplaceAll(modified, nil)
+				modified = inlineEventsRe.ReplaceAll(modified, []byte(`data-$1=$2`))
+			}
 			resp.Body = io.NopCloser(bytes.NewReader(modified))
 			resp.ContentLength = int64(len(modified))
 			resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(modified)))
@@ -996,6 +1006,33 @@ new MutationObserver(_patchArrowOnclicks).observe(document.documentElement, { ch
 		log.Printf("[smush-proxy] → https://www.hankgreen.com%s", r.URL.Path)
 		smushProxy.ServeHTTP(w, r)
 	}
+	// workerProxy forwards requests to the Smush Cloudflare Worker stats API.
+	workerTarget, _ := url.Parse("https://fourbythree-stats.hankmt.workers.dev")
+	workerProxy := httputil.NewSingleHostReverseProxy(workerTarget)
+	workerProxy.Transport = followRedirectsTransport{}
+	workerProxy.ModifyResponse = func(resp *http.Response) error {
+		log.Printf("[worker-proxy] upstream %s %s → %d", resp.Request.Method, resp.Request.URL, resp.StatusCode)
+		resp.Header.Set("Access-Control-Allow-Origin", "*")
+		return nil
+	}
+	workerProxyHandler := func(w http.ResponseWriter, r *http.Request) {
+		for _, pfx := range []string{"/fourbythree/smush/workerproxy", "/smush/workerproxy"} {
+			r.URL.Path = strings.TrimPrefix(r.URL.Path, pfx)
+			r.URL.RawPath = strings.TrimPrefix(r.URL.RawPath, pfx)
+		}
+		if r.URL.Path == "" {
+			r.URL.Path = "/"
+		}
+		r.Host = ""
+		log.Printf("[worker-proxy] → https://fourbythree-stats.hankmt.workers.dev%s", r.URL.Path)
+		workerProxy.ServeHTTP(w, r)
+	}
+	// Register before /fourbythree/smush/ so the more-specific pattern wins.
+	mux.HandleFunc("/fourbythree/smush/workerproxy/", workerProxyHandler)
+	mux.HandleFunc("/fourbythree/smush/workerproxy", workerProxyHandler)
+	mux.HandleFunc("/smush/workerproxy/", workerProxyHandler)
+	mux.HandleFunc("/smush/workerproxy", workerProxyHandler)
+
 	mux.HandleFunc("/smush/", smushGameHandler)
 	mux.HandleFunc("/smush", smushGameHandler)
 	// Discord's portal prefixes every path with /fourbythree, so /smush/ arrives as /fourbythree/smush/
