@@ -445,6 +445,30 @@ const _smushWrap = () => {
   console.log('[smush] gameOver hooked');
 };
 document.addEventListener('DOMContentLoaded', _smushWrap);
+
+// Restore inline event handlers rewritten to data-on* by the proxy.
+['click', 'keydown', 'input', 'change', 'submit'].forEach(evt => {
+  document.addEventListener(evt, function(event) {
+    let target = event.target;
+    while (target && target !== document) {
+      if (target.hasAttribute && target.hasAttribute('data-on' + evt)) {
+        const code = target.getAttribute('data-on' + evt);
+        const res = new Function('event', code).call(target, event);
+        if (res === false) { event.preventDefault(); }
+      }
+      target = target.parentNode;
+    }
+  });
+});
+
+['error', 'load'].forEach(evt => {
+  document.querySelectorAll('[data-on' + evt + ']').forEach(el => {
+    const code = el.getAttribute('data-on' + evt);
+    el.addEventListener(evt, function(event) {
+      new Function('event', code).call(this, event);
+    });
+  });
+});
 </script>`, clientID, clientID)
 
 	// Reverse proxy to hankgreen.com.
