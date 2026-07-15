@@ -28,11 +28,11 @@ import (
 // so its nonce-based policy does not block inline event handlers in the game.
 var cspMetaRe = regexp.MustCompile(`(?i)<meta[^>]+http-equiv=["']?Content-Security-Policy["']?[^>]*/?>`)
 
-// inlineEventsRe matches inline event handlers like onclick="..." which Discord's
-// CSP blocks because it removes the 'unsafe-inline' keyword. We rewrite them to
-// data-onclick="..." and bind them dynamically. This regex matches both single
-// and double quotes to catch handlers inside dynamically injected HTML strings.
-var inlineEventsRe = regexp.MustCompile(`(?i)\b(on(?:click|keydown|input|error|load|change|submit))=(["'][^"']*["'])`)
+// inlineEventsRe matches inline event handlers like onclick="...", onclick='...', or
+// onclick=()=>... (unquoted arrow functions) which Discord's CSP blocks by removing
+// 'unsafe-inline'. We rewrite them to data-* attributes and re-bind dynamically.
+// The alternation handles: quoted strings, or unquoted values up to the next whitespace/>
+var inlineEventsRe = regexp.MustCompile(`(?i)\b(on(?:click|keydown|input|error|load|change|submit))=(["'][^"']*["']|[^\s"'>]+)`)
 
 // upstreamTransport is used for all requests to hankgreen.com.
 //
@@ -300,30 +300,25 @@ if (inDiscord) {
   console.log('[4x3] Running outside Discord');
 }
 
-['click', 'keydown', 'input', 'change', 'submit'].forEach(evt => {
-  document.addEventListener(evt, function(event) {
-    let target = event.target;
-    while (target && target !== document) {
-      if (target.hasAttribute && target.hasAttribute('data-on' + evt)) {
-        const code = target.getAttribute('data-on' + evt);
-        const res = new Function('event', code).call(target, event);
-        if (res === false) {
-          event.preventDefault();
-        }
-      }
-      target = target.parentNode;
-    }
-  });
-});
-
-['error', 'load'].forEach(evt => {
-  document.querySelectorAll('[data-on' + evt + ']').forEach(el => {
-    const code = el.getAttribute('data-on' + evt);
-    el.addEventListener(evt, function(event) {
-      new Function('event', code).call(this, event);
+// Restore inline event handlers that were rewritten to data-on* by the proxy.
+// We set .onclick (etc.) directly on each element rather than using event delegation,
+// so handlers work regardless of propagation stopping. A MutationObserver ensures
+// dynamically-added elements are also patched.
+function _patchHandlers() {
+  ['onclick','onkeydown','oninput','onchange','onsubmit','onerror','onload'].forEach(ev => {
+    const attr = 'data-' + ev;
+    document.querySelectorAll('[' + attr + ']').forEach(el => {
+      if (el['__patched_' + ev]) return;
+      el['__patched_' + ev] = true;
+      const code = el.getAttribute(attr);
+      try { el[ev] = new Function('event', code); }
+      catch(e) { console.warn('[4x3] Failed to patch', attr, e); }
     });
   });
-});
+}
+_patchHandlers();
+document.addEventListener('DOMContentLoaded', _patchHandlers);
+new MutationObserver(_patchHandlers).observe(document.documentElement, { childList: true, subtree: true });
 
 // Auto-post image on finish
 const originalShowEnd = showResult;
@@ -446,29 +441,22 @@ const _smushWrap = () => {
 };
 document.addEventListener('DOMContentLoaded', _smushWrap);
 
-// Restore inline event handlers rewritten to data-on* by the proxy.
-['click', 'keydown', 'input', 'change', 'submit'].forEach(evt => {
-  document.addEventListener(evt, function(event) {
-    let target = event.target;
-    while (target && target !== document) {
-      if (target.hasAttribute && target.hasAttribute('data-on' + evt)) {
-        const code = target.getAttribute('data-on' + evt);
-        const res = new Function('event', code).call(target, event);
-        if (res === false) { event.preventDefault(); }
-      }
-      target = target.parentNode;
-    }
-  });
-});
-
-['error', 'load'].forEach(evt => {
-  document.querySelectorAll('[data-on' + evt + ']').forEach(el => {
-    const code = el.getAttribute('data-on' + evt);
-    el.addEventListener(evt, function(event) {
-      new Function('event', code).call(this, event);
+// Restore inline event handlers that were rewritten to data-on* by the proxy.
+function _patchHandlers() {
+  ['onclick','onkeydown','oninput','onchange','onsubmit','onerror','onload'].forEach(ev => {
+    const attr = 'data-' + ev;
+    document.querySelectorAll('[' + attr + ']').forEach(el => {
+      if (el['__patched_' + ev]) return;
+      el['__patched_' + ev] = true;
+      const code = el.getAttribute(attr);
+      try { el[ev] = new Function('event', code); }
+      catch(e) { console.warn('[smush] Failed to patch', attr, e); }
     });
   });
-});
+}
+_patchHandlers();
+document.addEventListener('DOMContentLoaded', _patchHandlers);
+new MutationObserver(_patchHandlers).observe(document.documentElement, { childList: true, subtree: true });
 </script>`, clientID, clientID)
 
 	// Reverse proxy to hankgreen.com.
