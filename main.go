@@ -280,7 +280,14 @@ if (inDiscord) {
     } else {
       const statusData = await statusRes.json();
       // If this session is for a different game, redirect there immediately.
+      // Save auth state in sessionStorage so the target page can skip sdk.ready().
       if (statusData.game_type === 'smush' && !window.location.pathname.startsWith('/smush')) {
+        try {
+          sessionStorage.setItem('discord_user_id', authenticatedUserId);
+          if (window.discordSdk && window.discordSdk.channelId) {
+            sessionStorage.setItem('discord_channel_id', window.discordSdk.channelId);
+          }
+        } catch(e) {}
         window.location.replace('/smush/' + window.location.search + window.location.hash);
       } else if (statusData.puzzle_link) {
         window.__puzzleLink = statusData.puzzle_link;
@@ -365,39 +372,54 @@ const inDiscord = new URLSearchParams(window.location.search).has('frame_id');
 let authenticatedUserId = null;
 
 if (inDiscord) {
-  const { DiscordSDK } = await import('/static/index.mjs');
-  const sdk = new DiscordSDK(%q);
-  window.discordSdk = sdk;
-  await sdk.ready();
-  console.log('[smush] Discord SDK ready');
-
+  // Fast path: the 4x3 landing page already ran sdk.ready() and stored auth in sessionStorage.
+  // Discord only fires READY once per iframe lifetime, so we must not call sdk.ready() again.
   try {
-    const { code } = await sdk.commands.authorize({
-      client_id: %q,
-      response_type: 'code',
-      prompt: 'none',
-      scope: ['identify']
-    });
-
-    const tokenResp = await fetch('api/token', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ code })
-    });
-    const tokenData = await tokenResp.json();
-
-    const auth = await sdk.commands.authenticate({
-      access_token: tokenData.access_token
-    });
-    authenticatedUserId = auth.user.id;
-    console.log('[smush] Authenticated user', authenticatedUserId);
-
-    const statusRes = await fetch('api/status?user_id=' + authenticatedUserId);
-    if (!statusRes.ok) {
-      console.log('[smush] No active game session — start with /playsmush to auto-share');
+    const cached = sessionStorage.getItem('discord_user_id');
+    if (cached) {
+      authenticatedUserId = cached;
+      const channelId = sessionStorage.getItem('discord_channel_id');
+      window.discordSdk = { channelId };
+      console.log('[smush] Using cached Discord auth, user:', authenticatedUserId);
     }
-  } catch(e) {
-    console.error('[smush] Auth failed', e);
+  } catch(e) {}
+
+  // Slow path: opened directly without going through the 4x3 landing page.
+  if (!authenticatedUserId) {
+    try {
+      const { DiscordSDK } = await import('/static/index.mjs');
+      const sdk = new DiscordSDK(%q);
+      window.discordSdk = sdk;
+      await sdk.ready();
+      console.log('[smush] Discord SDK ready');
+
+      const { code } = await sdk.commands.authorize({
+        client_id: %q,
+        response_type: 'code',
+        prompt: 'none',
+        scope: ['identify']
+      });
+
+      const tokenResp = await fetch('api/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code })
+      });
+      const tokenData = await tokenResp.json();
+
+      const auth = await sdk.commands.authenticate({
+        access_token: tokenData.access_token
+      });
+      authenticatedUserId = auth.user.id;
+      console.log('[smush] Authenticated user', authenticatedUserId);
+
+      const statusRes = await fetch('api/status?user_id=' + authenticatedUserId);
+      if (!statusRes.ok) {
+        console.log('[smush] No active game session — start with /playsmush to auto-share');
+      }
+    } catch(e) {
+      console.error('[smush] Auth failed', e);
+    }
   }
 } else {
   console.log('[smush] Running outside Discord');
