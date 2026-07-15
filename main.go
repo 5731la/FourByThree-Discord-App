@@ -885,7 +885,7 @@ new MutationObserver(_patchArrowOnclicks).observe(document.documentElement, { ch
 			// This avoids CORS/CSP blocks inside Discord's iframe.
 			modified := bytes.ReplaceAll(body,
 				[]byte("https://fourbythree-stats.hankmt.workers.dev"),
-				[]byte("/fourbythree/smush/workerproxy"),
+				[]byte("/smush/workerproxy"),
 			)
 			if isHTML {
 				modified = bytes.Replace(modified, []byte("</body>"), []byte(smushSDKScript+"\n</body>"), 1)
