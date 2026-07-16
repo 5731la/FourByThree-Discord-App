@@ -910,7 +910,7 @@ new MutationObserver(_patchArrowOnclicks).observe(document.documentElement, { ch
 		return nil
 	}
 
-	mux.HandleFunc("/smush/api/token", func(w http.ResponseWriter, r *http.Request) {
+	smushApiTokenHandler := func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "POST" {
 			http.Error(w, "POST required", 405)
 			return
@@ -944,9 +944,11 @@ new MutationObserver(_patchArrowOnclicks).observe(document.documentElement, { ch
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(resp.StatusCode)
 		io.Copy(w, resp.Body)
-	})
+	}
+	mux.HandleFunc("/smush/api/token", smushApiTokenHandler)
+	mux.HandleFunc("/fourbythree/smush/api/token", smushApiTokenHandler)
 
-	mux.HandleFunc("/smush/api/status", func(w http.ResponseWriter, r *http.Request) {
+	smushApiStatusHandler := func(w http.ResponseWriter, r *http.Request) {
 		userID := r.URL.Query().Get("user_id")
 		if userID == "" {
 			http.Error(w, "missing user_id", 400)
@@ -961,9 +963,11 @@ new MutationObserver(_patchArrowOnclicks).observe(document.documentElement, { ch
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-	})
+	}
+	mux.HandleFunc("/smush/api/status", smushApiStatusHandler)
+	mux.HandleFunc("/fourbythree/smush/api/status", smushApiStatusHandler)
 
-	mux.HandleFunc("/smush/api/result", func(w http.ResponseWriter, r *http.Request) {
+	smushApiResultHandler := func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "POST" {
 			http.Error(w, "POST required", 405)
 			return
@@ -999,7 +1003,9 @@ new MutationObserver(_patchArrowOnclicks).observe(document.documentElement, { ch
 			return
 		}
 		w.WriteHeader(200)
-	})
+	}
+	mux.HandleFunc("/smush/api/result", smushApiResultHandler)
+	mux.HandleFunc("/fourbythree/smush/api/result", smushApiResultHandler)
 
 	// /smush/* — proxy Smush game and its assets.
 	// Requests arrive as /smush/... or /fourbythree/smush/... (the catch-all
