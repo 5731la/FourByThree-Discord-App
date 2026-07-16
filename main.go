@@ -157,7 +157,7 @@ func verifyInteraction(r *http.Request, pubKey ed25519.PublicKey) ([]byte, bool)
 	return body, ed25519.Verify(pubKey, msg, sig)
 }
 
-func createFollowupMessage(appID, token, userID, textResult, puzzleLink string, imgBlob []byte) error {
+func createFollowupMessage(appID, token, userID, textResult, puzzleLink, content string, imgBlob []byte) error {
 	url := fmt.Sprintf("https://discord.com/api/v10/webhooks/%s/%s", appID, token)
 
 	body := &bytes.Buffer{}
@@ -177,11 +177,10 @@ func createFollowupMessage(appID, token, userID, textResult, puzzleLink string, 
 		} `json:"attachments"`
 	}{
 		Content: func() string {
-			s := fmt.Sprintf("<@%s> finished their 4\u00d73 game!", userID)
 			if puzzleLink != "" {
-				s += fmt.Sprintf(" [View puzzle](%s)", puzzleLink)
+				return content + fmt.Sprintf(" [View puzzle](%s)", puzzleLink)
 			}
-			return s
+			return content
 		}(),
 		Attachments: []struct {
 			ID          int    `json:"id"`
@@ -430,8 +429,10 @@ if (inDiscord) {
 
 // Hook gameOver() — called by Smush when the puzzle is completed.
 const _smushUpload = async () => {
-  if (window.__smushUploaded || !inDiscord || !authenticatedUserId) return;
+  const todayKey = 'smush_uploaded_' + new Date().toDateString();
+  if (window.__smushUploaded || !inDiscord || !authenticatedUserId || localStorage.getItem(todayKey)) return;
   window.__smushUploaded = true;
+  localStorage.setItem(todayKey, '1');
   try {
     const canvas = typeof window.drawShareCard === 'function' ? window.drawShareCard() : null;
     if (!canvas) { console.error('[smush] drawShareCard not available'); return; }
@@ -862,7 +863,8 @@ new MutationObserver(_patchArrowOnclicks).observe(document.documentElement, { ch
 			return
 		}
 
-		if err := createFollowupMessage(session.AppID, session.Token, userID, textResult, puzzleLink, imgBlob); err != nil {
+		content := fmt.Sprintf("<@%s> finished their 4\u00d73 game!", userID)
+		if err := createFollowupMessage(session.AppID, session.Token, userID, textResult, puzzleLink, content, imgBlob); err != nil {
 			log.Printf("Failed to create followup message: %v", err)
 			http.Error(w, "failed to post", 500)
 			return
@@ -898,6 +900,7 @@ new MutationObserver(_patchArrowOnclicks).observe(document.documentElement, { ch
 				[]byte("/smush/workerproxy"),
 			)
 			if isHTML {
+				modified = bytes.Replace(modified, []byte("function shareText(){"), []byte("window.shareText = function shareText(){"), 1)
 				modified = bytes.Replace(modified, []byte("</body>"), []byte(smushSDKScript+"\n</body>"), 1)
 				modified = cspMetaRe.ReplaceAll(modified, nil)
 				modified = inlineEventsRe.ReplaceAll(modified, []byte(`data-$1=$2`))
@@ -997,7 +1000,7 @@ new MutationObserver(_patchArrowOnclicks).observe(document.documentElement, { ch
 			return
 		}
 		content := fmt.Sprintf("<@%s> finished today's Smush!", userID)
-		if err := createFollowupMessage(session.AppID, session.Token, userID, textResult, "", imgBlob); err != nil {
+		if err := createFollowupMessage(session.AppID, session.Token, userID, textResult, "", content, imgBlob); err != nil {
 			log.Printf("[smush] Failed to post followup: %v (content would have been: %s)", err, content)
 			http.Error(w, "failed to post", 500)
 			return
