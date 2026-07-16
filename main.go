@@ -281,14 +281,17 @@ if (inDiscord) {
       const statusData = await statusRes.json();
       // If this session is for a different game, redirect there immediately.
       // Save auth state in sessionStorage so the target page can skip sdk.ready().
-      if (statusData.game_type === 'smush' && !window.location.pathname.startsWith('/smush')) {
+      if (statusData.game_type === 'smush' && !window.location.pathname.includes('smush')) {
         try {
           sessionStorage.setItem('discord_user_id', authenticatedUserId);
           if (window.discordSdk && window.discordSdk.channelId) {
             sessionStorage.setItem('discord_channel_id', window.discordSdk.channelId);
           }
         } catch(e) {}
-        window.location.replace('/smush/' + window.location.search + window.location.hash);
+        
+        let basePath = window.location.pathname;
+        if (!basePath.endsWith('/')) basePath += '/';
+        window.location.replace(basePath + 'smush/' + window.location.search + window.location.hash);
       } else if (statusData.puzzle_link) {
         window.__puzzleLink = statusData.puzzle_link;
         // Extract the hash fragment and navigate the game to it.
@@ -329,10 +332,10 @@ new MutationObserver(_patchHandlers).observe(document.documentElement, { childLi
 
 // Auto-post image on finish — guard against showResult not yet defined (loaded async).
 const _hookShowResult = () => {
-  if (typeof showResult !== 'function') { setTimeout(_hookShowResult, 200); return; }
-  const _origShowResult = showResult;
-  showResult = function(won, score, fancy, quiet) {
-    _origShowResult(won, score, fancy, quiet);
+  if (typeof window.showResult !== 'function') { setTimeout(_hookShowResult, 200); return; }
+  const _origShowResult = window.showResult;
+  window.showResult = function(won, score, fancy, quiet) {
+    _origShowResult.apply(this, arguments);
     if (!window.__uploadedResult && inDiscord && authenticatedUserId) {
       window.__uploadedResult = true;
       try {
@@ -430,7 +433,7 @@ const _smushUpload = async () => {
   if (window.__smushUploaded || !inDiscord || !authenticatedUserId) return;
   window.__smushUploaded = true;
   try {
-    const canvas = typeof drawShareCard === 'function' ? drawShareCard() : null;
+    const canvas = typeof window.drawShareCard === 'function' ? window.drawShareCard() : null;
     if (!canvas) { console.error('[smush] drawShareCard not available'); return; }
     canvas.toBlob(async blob => {
       if (!blob) return;
@@ -440,7 +443,7 @@ const _smushUpload = async () => {
       if (window.discordSdk && window.discordSdk.channelId) {
         formData.append('channel_id', window.discordSdk.channelId);
       }
-      try { formData.append('text_result', shareText ? shareText() : ''); } catch(e) {}
+      try { formData.append('text_result', typeof window.shareText === 'function' ? window.shareText() : ''); } catch(e) {}
       const res = await fetch('api/result', { method: 'POST', body: formData });
       if (res.ok) {
         console.log('[smush] Score shared to chat!');
@@ -454,16 +457,16 @@ const _smushUpload = async () => {
 // Wrap gameOver so we can intercept it after the game defines it.
 // Smush defines gameOver inline, so we poll until it exists then wrap it.
 const _smushWrap = () => {
-  if (typeof gameOver !== 'function') { setTimeout(_smushWrap, 200); return; }
-  const _orig = gameOver;
-  gameOver = function(...args) {
+  if (typeof window.gameOver !== 'function') { setTimeout(_smushWrap, 200); return; }
+  const _orig = window.gameOver;
+  window.gameOver = function(...args) {
     const ret = _orig.apply(this, args);
     _smushUpload();
     return ret;
   };
   console.log('[smush] gameOver hooked');
 };
-document.addEventListener('DOMContentLoaded', _smushWrap);
+_smushWrap();
 
 // Restore inline event handlers that were rewritten to data-on* by the proxy.
 function _patchHandlers() {
