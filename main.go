@@ -454,19 +454,26 @@ const _smushUpload = async () => {
   } catch(e) { console.error('[smush] Upload failed', e); }
 };
 
-// Wrap gameOver so we can intercept it after the game defines it.
-// Smush defines gameOver inline, so we poll until it exists then wrap it.
-const _smushWrap = () => {
-  if (typeof window.gameOver !== 'function') { setTimeout(_smushWrap, 200); return; }
-  const _orig = window.gameOver;
-  window.gameOver = function(...args) {
-    const ret = _orig.apply(this, args);
+// Smush defines gameOver inline inside an IIFE, so we cannot hook it directly.
+// Instead, we observe the DOM for the game over modal being shown.
+const _smushObserver = new MutationObserver(() => {
+  if (document.getElementById('finalScore')) {
     _smushUpload();
-    return ret;
-  };
-  console.log('[smush] gameOver hooked');
-};
-_smushWrap();
+    _smushObserver.disconnect();
+  }
+});
+
+// The modal container #mbody is populated when the game ends
+const mbody = document.getElementById('mbody');
+if (mbody) {
+  _smushObserver.observe(mbody, { childList: true, subtree: true });
+  // Check if it's already there (e.g. game was already over on load)
+  if (document.getElementById('finalScore')) _smushUpload();
+} else {
+  // Fallback to body if mbody isn't found for some reason
+  _smushObserver.observe(document.body, { childList: true, subtree: true });
+}
+console.log('[smush] gameOver observer installed');
 
 // Restore inline event handlers that were rewritten to data-on* by the proxy.
 function _patchHandlers() {
