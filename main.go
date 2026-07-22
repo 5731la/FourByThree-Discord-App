@@ -872,6 +872,19 @@ func main() {
 	mux.HandleFunc("/fourbythree/fourbythree/", fourbythreeGameHandler)
 	mux.HandleFunc("/fourbythree/fourbythree", fourbythreeGameHandler)
 
+	// /api/* — game iframe fetches resolve here (double-prefixed).
+	// Strip the double prefix so requests reach our Go API handlers at /fourbythree/api/.
+	for _, pfx := range []string{"/fourbythree/fourbythree/api/", "/fourbythree/fourbythree/api"} {
+		mux.HandleFunc(pfx, func(w http.ResponseWriter, r *http.Request) {
+			r.URL.Path = "/fourbythree" + strings.TrimPrefix(r.URL.Path, "/fourbythree/fourbythree")
+			r.URL.RawPath = "/fourbythree" + strings.TrimPrefix(r.URL.RawPath, "/fourbythree/fourbythree")
+			r.Host = ""
+			log.Printf("[api-forward] → /fourbythree%s", r.URL.Path)
+			// Re-dispatch through our local mux to reach the /fourbythree/api/ handlers.
+			mux.ServeHTTP(w, r)
+		})
+	}
+
 	// /fourbythree/* — the game itself and its assets (puzzles.json, images, etc.)
 	mux.HandleFunc("/fourbythree/", proxyHandler(""))
 	mux.HandleFunc("/fourbythree", proxyHandler(""))
