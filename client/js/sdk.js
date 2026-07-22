@@ -135,13 +135,15 @@ if (isSmush) {
   }
   console.log('[' + gameTag + '] gameOver observer installed');
 } else {
-  // 4x3: hook showResult — only upload when won=true (game actually finished).
+  // 4x3: hook showResult — only upload once per game.
+  // Set __uploadedResult = true BEFORE the async toBlob call to block
+  // rapid successive showResult() calls that can race the flag.
   const _hookShowResult = () => {
     if (typeof window.showResult !== 'function') { setTimeout(_hookShowResult, 200); return; }
     const _origShowResult = window.showResult;
     window.showResult = function(won, score, fancy, quiet) {
       _origShowResult.apply(this, arguments);
-      if (!won || window.__uploadedResult || !inDiscord || !authenticatedUserId) return;
+      if (window.__uploadedResult || !inDiscord || !authenticatedUserId) return;
       window.__uploadedResult = true;
       try {
         window.drawShareCard().toBlob(async blob => {
