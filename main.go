@@ -138,7 +138,7 @@ func renderJS(path string, clientID string) string {
 	if err := tmpl.Execute(&buf, struct{ ClientID string }{ClientID: clientID}); err != nil {
 		panic(fmt.Sprintf("render js %s: %v", path, err))
 	}
-	return buf.String()
+	return "<script>" + buf.String() + "</script>"
 }
 
 // activeGames maps a Discord user ID to the interaction session
