@@ -19,6 +19,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"text/template"
 	"time"
 )
 
@@ -116,6 +117,29 @@ func isRedirect(status int) bool {
 //
 //go:embed all:client/static
 var staticFiles embed.FS
+
+//go:embed all:client/js
+var jsFiles embed.FS
+
+// readJS reads an embedded JS file and returns its content.
+func readJS(path string) string {
+	b, err := fs.ReadFile(jsFiles, path)
+	if err != nil {
+		panic(fmt.Sprintf("read js %s: %v", path, err))
+	}
+	return string(b)
+}
+
+// renderJS renders a JS template with {{.ClientID}} substitution.
+func renderJS(path string, clientID string) string {
+	src := readJS(path)
+	tmpl := template.Must(template.New(path).Parse(src))
+	var buf strings.Builder
+	if err := tmpl.Execute(&buf, struct{ ClientID string }{ClientID: clientID}); err != nil {
+		panic(fmt.Sprintf("render js %s: %v", path, err))
+	}
+	return buf.String()
+}
 
 // activeGames maps a Discord user ID to the interaction session
 type GameSession struct {
@@ -234,285 +258,14 @@ func main() {
 		redirectURI = "https://fourbythreediscord.stellasec.com"
 	}
 
-	// discordSDKScript is injected into every HTML page served from hankgreen.com.
-	// 1. Initialises the Discord Embedded App SDK if running inside an Activity.
-	// 2. Restores inline event handlers (onclick, etc.) that Discord's CSP blocks.
-	//    Discord's proxy strips 'unsafe-inline' but keeps 'unsafe-eval', allowing
-	//    us to bind the rewritten data-on* attributes using new Function().
-	discordSDKScript := fmt.Sprintf(`<script type="module">
-const inDiscord = new URLSearchParams(window.location.search).has('frame_id');
-let authenticatedUserId = null;
+	// parentScript is injected into the launcher page (Activity iframe root).
+	// It handles auth, checks the status API for game type, and injects a
+	// child iframe for the selected game.
+	parentScript := renderJS("client/js/parent.js", clientID)
 
-if (inDiscord) {
-  const { DiscordSDK } = await import('/static/index.mjs');
-  const sdk = new DiscordSDK(%q);
-  window.discordSdk = sdk;
-  await sdk.ready();
-  console.log('[4x3] Discord SDK ready');
-
-  try {
-    const { code } = await sdk.commands.authorize({
-      client_id: %q,
-      response_type: 'code',
-      prompt: 'none',
-      scope: ['identify']
-    });
-    
-    const tokenResp = await fetch('api/token', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ code })
-    });
-    const tokenData = await tokenResp.json();
-    
-    const auth = await sdk.commands.authenticate({
-      access_token: tokenData.access_token
-    });
-    authenticatedUserId = auth.user.id;
-    console.log('[4x3] Authenticated user', authenticatedUserId);
-
-    const statusRes = await fetch('api/status?user_id=' + authenticatedUserId);
-    if (!statusRes.ok) {
-      if (typeof window.toast === 'function') {
-        window.toast("Start the game with /play4x3 to auto-share your score!", 5000);
-      }
-    } else {
-      const statusData = await statusRes.json();
-      // If this session is for a different game, redirect there immediately.
-      // Save auth state in sessionStorage so the target page can skip sdk.ready().
-      if (statusData.game_type === 'smush' && !window.location.pathname.includes('smush')) {
-        try {
-          sessionStorage.setItem('discord_user_id', authenticatedUserId);
-          if (window.discordSdk && window.discordSdk.channelId) {
-            sessionStorage.setItem('discord_channel_id', window.discordSdk.channelId);
-          }
-        } catch(e) {}
-        
-        let basePath = window.location.pathname;
-        if (!basePath.endsWith('/')) basePath += '/';
-        window.location.replace(basePath + 'smush/' + window.location.search + window.location.hash);
-      } else if (statusData.puzzle_link) {
-        window.__puzzleLink = statusData.puzzle_link;
-        // Extract the hash fragment and navigate the game to it.
-        try {
-          const hashIdx = statusData.puzzle_link.indexOf('#');
-          if (hashIdx !== -1) {
-            window.location.hash = statusData.puzzle_link.slice(hashIdx + 1);
-          }
-        } catch(e) { console.error('[4x3] Failed to apply puzzle hash', e); }
-      }
-    }
-  } catch(e) {
-    console.error('[4x3] Auth failed', e);
-  }
-} else {
-  console.log('[4x3] Running outside Discord');
-}
-
-// Restore inline event handlers that were rewritten to data-on* by the proxy.
-// We set .onclick (etc.) directly on each element rather than using event delegation,
-// so handlers work regardless of propagation stopping. A MutationObserver ensures
-// dynamically-added elements are also patched.
-function _patchHandlers() {
-  ['onclick','onkeydown','oninput','onchange','onsubmit','onerror','onload'].forEach(ev => {
-    const attr = 'data-' + ev;
-    document.querySelectorAll('[' + attr + ']').forEach(el => {
-      if (el['__patched_' + ev]) return;
-      el['__patched_' + ev] = true;
-      const code = el.getAttribute(attr);
-      try { el[ev] = new Function('event', code); }
-      catch(e) { console.warn('[4x3] Failed to patch', attr, e); }
-    });
-  });
-}
-_patchHandlers();
-document.addEventListener('DOMContentLoaded', _patchHandlers);
-new MutationObserver(_patchHandlers).observe(document.documentElement, { childList: true, subtree: true });
-
-// Auto-post image on finish — guard against showResult not yet defined (loaded async).
-const _hookShowResult = () => {
-  if (typeof window.showResult !== 'function') { setTimeout(_hookShowResult, 200); return; }
-  const _origShowResult = window.showResult;
-  window.showResult = function(won, score, fancy, quiet) {
-    _origShowResult.apply(this, arguments);
-    if (!window.__uploadedResult && inDiscord && authenticatedUserId) {
-      window.__uploadedResult = true;
-      try {
-        window.drawShareCard().toBlob(async blob => {
-          if (!blob) return;
-          const formData = new FormData();
-          formData.append('image', blob, 'result.png');
-          formData.append('user_id', authenticatedUserId);
-          if (window.discordSdk && window.discordSdk.channelId) {
-            formData.append('channel_id', window.discordSdk.channelId);
-          }
-          try { formData.append('text_result', window.resultDescription()); } catch(err) {}
-          if (window.__puzzleLink) { formData.append('puzzle_link', window.__puzzleLink); }
-          const res = await fetch('api/result', { method: 'POST', body: formData });
-          if (!res.ok) {
-            if (typeof window.toast === 'function') {
-              window.toast("Start game with /play4x3 to auto-share!", 4000);
-            }
-          } else {
-            if (typeof window.toast === 'function') {
-              window.toast("Score shared to chat!", 3000);
-            }
-          }
-        });
-      } catch (e) { console.error('Upload failed', e); }
-    }
-  };
-};
-_hookShowResult();
-</script>`, clientID, clientID)
-
-	// smushSDKScript is injected into every Smush HTML page.
-	// Smush uses inline JS with gameOver() as the completion hook,
-	// drawShareCard() for the canvas image, and shareText() for the text summary.
-	smushSDKScript := fmt.Sprintf(`<script type="module">
-const inDiscord = new URLSearchParams(window.location.search).has('frame_id');
-let authenticatedUserId = null;
-
-if (inDiscord) {
-  // Fast path: the 4x3 landing page already ran sdk.ready() and stored auth in sessionStorage.
-  // Discord only fires READY once per iframe lifetime, so we must not call sdk.ready() again.
-  try {
-    const cached = sessionStorage.getItem('discord_user_id');
-    if (cached) {
-      authenticatedUserId = cached;
-      const channelId = sessionStorage.getItem('discord_channel_id');
-      window.discordSdk = { channelId };
-      console.log('[smush] Using cached Discord auth, user:', authenticatedUserId);
-    }
-  } catch(e) {}
-
-  // Slow path: opened directly without going through the 4x3 landing page.
-  if (!authenticatedUserId) {
-    try {
-      const { DiscordSDK } = await import('/static/index.mjs');
-      const sdk = new DiscordSDK(%q);
-      window.discordSdk = sdk;
-      await sdk.ready();
-      console.log('[smush] Discord SDK ready');
-
-      const { code } = await sdk.commands.authorize({
-        client_id: %q,
-        response_type: 'code',
-        prompt: 'none',
-        scope: ['identify']
-      });
-
-      const tokenResp = await fetch('api/token', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ code })
-      });
-      const tokenData = await tokenResp.json();
-
-      const auth = await sdk.commands.authenticate({
-        access_token: tokenData.access_token
-      });
-      authenticatedUserId = auth.user.id;
-      console.log('[smush] Authenticated user', authenticatedUserId);
-
-      const statusRes = await fetch('api/status?user_id=' + authenticatedUserId);
-      if (!statusRes.ok) {
-        console.log('[smush] No active game session — start with /playsmush to auto-share');
-      }
-    } catch(e) {
-      console.error('[smush] Auth failed', e);
-    }
-  }
-} else {
-  console.log('[smush] Running outside Discord');
-}
-
-// Hook gameOver() — called by Smush when the puzzle is completed.
-const _smushUpload = async () => {
-  const todayKey = 'smush_uploaded_' + new Date().toDateString();
-  if (window.__smushUploaded || !inDiscord || !authenticatedUserId || localStorage.getItem(todayKey)) return;
-  window.__smushUploaded = true;
-  localStorage.setItem(todayKey, '1');
-  try {
-    const canvas = typeof window.drawShareCard === 'function' ? window.drawShareCard() : null;
-    if (!canvas) { console.error('[smush] drawShareCard not available'); return; }
-    canvas.toBlob(async blob => {
-      if (!blob) return;
-      const formData = new FormData();
-      formData.append('image', blob, 'result.png');
-      formData.append('user_id', authenticatedUserId);
-      if (window.discordSdk && window.discordSdk.channelId) {
-        formData.append('channel_id', window.discordSdk.channelId);
-      }
-      try { formData.append('text_result', typeof window.shareText === 'function' ? window.shareText() : ''); } catch(e) {}
-      const res = await fetch('api/result', { method: 'POST', body: formData });
-      if (res.ok) {
-        console.log('[smush] Score shared to chat!');
-      } else {
-        console.warn('[smush] Share failed — start with /playsmush to enable auto-share');
-      }
-    });
-  } catch(e) { console.error('[smush] Upload failed', e); }
-};
-
-// Smush defines gameOver inline inside an IIFE, so we cannot hook it directly.
-// Instead, we observe the DOM for the game over modal being shown.
-const _smushObserver = new MutationObserver(() => {
-  if (document.getElementById('finalScore')) {
-    _smushUpload();
-    _smushObserver.disconnect();
-  }
-});
-
-// The modal container #mbody is populated when the game ends
-const mbody = document.getElementById('mbody');
-if (mbody) {
-  _smushObserver.observe(mbody, { childList: true, subtree: true });
-  // Check if it's already there (e.g. game was already over on load)
-  if (document.getElementById('finalScore')) _smushUpload();
-} else {
-  // Fallback to body if mbody isn't found for some reason
-  _smushObserver.observe(document.body, { childList: true, subtree: true });
-}
-console.log('[smush] gameOver observer installed');
-
-// Restore inline event handlers that were rewritten to data-on* by the proxy.
-function _patchHandlers() {
-  ['onclick','onkeydown','oninput','onchange','onsubmit','onerror','onload'].forEach(ev => {
-    const attr = 'data-' + ev;
-    document.querySelectorAll('[' + attr + ']').forEach(el => {
-      if (el['__patched_' + ev]) return;
-      el['__patched_' + ev] = true;
-      const code = el.getAttribute(attr);
-      try { el[ev] = new Function('event', code); }
-      catch(e) { console.warn('[smush] Failed to patch', attr, e); }
-    });
-  });
-}
-_patchHandlers();
-document.addEventListener('DOMContentLoaded', _patchHandlers);
-new MutationObserver(_patchHandlers).observe(document.documentElement, { childList: true, subtree: true });
-
-// Unquoted arrow function onclick=()=>fn() attrs survive the proxy rewrite (the regex can't
-// safely rewrite them). Discord's CSP blocks them, but the attribute is still in the DOM.
-// Re-bind them via addEventListener using eval-equivalent so they run in global scope.
-function _patchArrowOnclicks() {
-  document.querySelectorAll('[onclick]').forEach(el => {
-    if (el.__arrowPatched) return;
-    el.__arrowPatched = true;
-    const raw = el.getAttribute('onclick');
-    if (!raw) return;
-    el.removeAttribute('onclick');
-    el.addEventListener('click', function(event) {
-      try { (new Function('event', raw)).call(this, event); }
-      catch(e) { console.warn('[smush] arrow onclick error:', raw, e); }
-    });
-  });
-}
-_patchArrowOnclicks();
-document.addEventListener('DOMContentLoaded', _patchArrowOnclicks);
-new MutationObserver(_patchArrowOnclicks).observe(document.documentElement, { childList: true, subtree: true });
-</script>`, clientID, clientID)
+	// sdkScript is injected into game iframe pages (4x3 or smush).
+	// It auto-detects the game type and uses the appropriate hooks.
+	sdkScript := renderJS("client/js/sdk.js", clientID)
 
 	// Reverse proxy to hankgreen.com.
 	// All game paths are forwarded directly — no nested iframe — so that
@@ -540,7 +293,7 @@ new MutationObserver(_patchArrowOnclicks).observe(document.documentElement, { ch
 			if err != nil {
 				return err
 			}
-			modified := bytes.Replace(body, []byte("</body>"), []byte(discordSDKScript+"\n</body>"), 1)
+			modified := bytes.Replace(body, []byte("</body>"), []byte(parentScript+"\n</body>"), 1)
 			// Also strip any CSP meta tag — Next.js embeds the policy in the
 			// HTML body as well as the header, and its nonce blocks the game's
 			// own inline event handlers when served inside Discord's iframe.
@@ -901,7 +654,7 @@ new MutationObserver(_patchArrowOnclicks).observe(document.documentElement, { ch
 			)
 			if isHTML {
 				modified = bytes.Replace(modified, []byte("function shareText(){"), []byte("window.shareText = function shareText(){"), 1)
-				modified = bytes.Replace(modified, []byte("</body>"), []byte(smushSDKScript+"\n</body>"), 1)
+				modified = bytes.Replace(modified, []byte("</body>"), []byte(sdkScript+"\n</body>"), 1)
 				modified = cspMetaRe.ReplaceAll(modified, nil)
 				modified = inlineEventsRe.ReplaceAll(modified, []byte(`data-$1=$2`))
 			}
