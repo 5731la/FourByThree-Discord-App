@@ -909,7 +909,29 @@ func main() {
 	// Does NOT proxy hankgreen.com — the parentScript handles auth and iframe injection.
 	mux.HandleFunc("/fourbythree/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Write([]byte("<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>FourByThree</title></head><body>" + parentScript + "</body></html>"))
+		w.Write([]byte(`<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>FourByThree</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; background: #36393f; }
+  body { display: flex; align-items: center; justify-content: center; font-family: gg sans, 'Open Sans', Arial, sans-serif; }
+  .loader { text-align: center; color: #b9bbbe; }
+  .loader h1 { font-size: 28px; margin-bottom: 12px; color: #ffffff; }
+  .loader p { font-size: 14px; margin-bottom: 20px; }
+  .loader a { color: #7289da; text-decoration: none; font-size: 13px; }
+  .loader a:hover { text-decoration: underline; }
+  .spinner { width: 40px; height: 40px; border: 4px solid #4f545c; border-top-color: #7289da; border-radius: 50%; margin: 0 auto 20px; animation: spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style></head>
+<body>
+<div class="loader">
+  <div class="spinner"></div>
+  <h1>FourByThree</h1>
+  <p>Loading game…</p>
+  <a href="https://github.com/5731la/FourByThree-Discord-App" target="_blank" rel="noopener">View on GitHub</a>
+</div>
+` + parentScript + `</body></html>`))
 	})
 	mux.HandleFunc("/fourbythree", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/fourbythree/", http.StatusFound)
