@@ -837,6 +837,19 @@ func main() {
 		}
 	}
 
+	// /api/* — game iframe fetches resolve here (double-prefixed).
+	// Strip the double prefix so requests reach our Go API handlers at /fourbythree/api/.
+	for _, pfx := range []string{"/fourbythree/fourbythree/api/", "/fourbythree/fourbythree/api"} {
+		mux.HandleFunc(pfx, func(w http.ResponseWriter, r *http.Request) {
+			r.URL.Path = "/fourbythree" + strings.TrimPrefix(r.URL.Path, "/fourbythree/fourbythree")
+			r.URL.RawPath = "/fourbythree" + strings.TrimPrefix(r.URL.RawPath, "/fourbythree/fourbythree")
+			r.Host = ""
+			log.Printf("[api-forward] → /fourbythree%s", r.URL.Path)
+			// Re-dispatch through our local mux to reach the /fourbythree/api/ handlers.
+			mux.ServeHTTP(w, r)
+		})
+	}
+
 	// /fourbythree/fourbythree/* — double-prefixed path from iframe src="/fourbythree/".
 	// Discord always prepends /fourbythree, so iframe src="/fourbythree/" becomes
 	// /fourbythree/fourbythree/ on the server. Strip the extra prefix before forwarding.
@@ -856,11 +869,25 @@ func main() {
 			}
 			// Inject the unified SDK script for game pages.
 			modified := bytes.Replace(body, []byte("</body>"), []byte(sdkScript+"\n</body>"), 1)
+			// Rewrite the Cloudflare Worker stats API so it goes through our proxy.
+			// This avoids CORS/CSP blocks inside Discord's iframe.
+			modified = bytes.ReplaceAll(modified,
+				[]byte("https://fourbythree-stats.hankmt.workers.dev"),
+				[]byte("/smush/workerproxy"),
+			)
+			// Also strip any CSP meta tag — Next.js embeds the policy in the
+			// HTML body as well as the header, and its nonce blocks the game's
+			// own inline event handlers when served inside Discord's iframe.
 			modified = cspMetaRe.ReplaceAll(modified, nil)
+
+			// Rewrite inline event handlers (onclick="..." -> data-onclick="...")
+			// so they bypass Discord's strict CSP blocking 'unsafe-inline'.
 			modified = inlineEventsRe.ReplaceAll(modified, []byte(`data-$1=$2`))
+
 			resp.Body = io.NopCloser(bytes.NewReader(modified))
 			resp.ContentLength = int64(len(modified))
 			resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(modified)))
+			// Remove transfer-encoding so the fixed Content-Length is authoritative.
 			resp.Header.Del("Transfer-Encoding")
 		}
 		return nil
@@ -874,26 +901,19 @@ func main() {
 		log.Printf("[fourbythree-proxy] → https://www.hankgreen.com%s", r.URL.Path)
 		fourbythreeProxy.ServeHTTP(w, r)
 	}
-	// Register before the catch-all /fourbythree/ so this takes priority.
+	// Register before the /fourbythree/ launcher so this takes priority.
 	mux.HandleFunc("/fourbythree/fourbythree/", fourbythreeGameHandler)
 	mux.HandleFunc("/fourbythree/fourbythree", fourbythreeGameHandler)
 
-	// /api/* — game iframe fetches resolve here (double-prefixed).
-	// Strip the double prefix so requests reach our Go API handlers at /fourbythree/api/.
-	for _, pfx := range []string{"/fourbythree/fourbythree/api/", "/fourbythree/fourbythree/api"} {
-		mux.HandleFunc(pfx, func(w http.ResponseWriter, r *http.Request) {
-			r.URL.Path = "/fourbythree" + strings.TrimPrefix(r.URL.Path, "/fourbythree/fourbythree")
-			r.URL.RawPath = "/fourbythree" + strings.TrimPrefix(r.URL.RawPath, "/fourbythree/fourbythree")
-			r.Host = ""
-			log.Printf("[api-forward] → /fourbythree%s", r.URL.Path)
-			// Re-dispatch through our local mux to reach the /fourbythree/api/ handlers.
-			mux.ServeHTTP(w, r)
-		})
-	}
-
-	// /fourbythree/* — the game itself and its assets (puzzles.json, images, etc.)
-	mux.HandleFunc("/fourbythree/", proxyHandler(""))
-	mux.HandleFunc("/fourbythree", proxyHandler(""))
+	// /fourbythree/ — launcher page (blank/loading with parentScript).
+	// Does NOT proxy hankgreen.com — the parentScript handles auth and iframe injection.
+	mux.HandleFunc("/fourbythree/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write([]byte("<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>FourByThree</title></head><body>" + parentScript + "</body></html>"))
+	})
+	mux.HandleFunc("/fourbythree", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/fourbythree/", http.StatusFound)
+	})
 
 	// /_next/* — Next.js static bundles (JS, CSS) referenced by absolute path in the HTML.
 	mux.HandleFunc("/_next/", proxyHandler(""))
