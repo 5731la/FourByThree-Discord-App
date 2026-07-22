@@ -138,12 +138,14 @@ if (isSmush) {
   // 4x3: hook showResult — only upload once per game.
   // Set __uploadedResult = true BEFORE the async toBlob call to block
   // rapid successive showResult() calls that can race the flag.
+  // Also check localStorage so a page reload won't re-upload.
   const _hookShowResult = () => {
     if (typeof window.showResult !== 'function') { setTimeout(_hookShowResult, 200); return; }
     const _origShowResult = window.showResult;
     window.showResult = function(won, score, fancy, quiet) {
       _origShowResult.apply(this, arguments);
-      if (window.__uploadedResult || !inDiscord || !authenticatedUserId) return;
+      const todayKey = '4x3_uploaded_' + new Date().toDateString();
+      if (window.__uploadedResult || localStorage.getItem(todayKey) || !inDiscord || !authenticatedUserId) return;
       window.__uploadedResult = true;
       try {
         window.drawShareCard().toBlob(async blob => {
