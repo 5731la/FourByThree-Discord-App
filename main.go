@@ -294,6 +294,12 @@ func main() {
 				return err
 			}
 			modified := bytes.Replace(body, []byte("</body>"), []byte(parentScript+"\n</body>"), 1)
+			// Rewrite the Cloudflare Worker stats API so it goes through our proxy.
+			// This avoids CORS/CSP blocks inside Discord's iframe.
+			modified = bytes.ReplaceAll(modified,
+				[]byte("https://fourbythree-stats.hankmt.workers.dev"),
+				[]byte("/smush/workerproxy"),
+			)
 			// Also strip any CSP meta tag — Next.js embeds the policy in the
 			// HTML body as well as the header, and its nonce blocks the game's
 			// own inline event handlers when served inside Discord's iframe.
