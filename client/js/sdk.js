@@ -135,15 +135,34 @@ if (isSmush) {
   }
   console.log('[' + gameTag + '] gameOver observer installed');
 } else {
-  // 4x3: observe the results modal by aria-label (one-shot signal).
-  const _cardObserver = new MutationObserver(() => {
-    if (document.querySelector('[aria-label="Results"]')) {
-      _uploadScore();
-      _cardObserver.disconnect();
-    }
-  });
-  _cardObserver.observe(document.body, { childList: true, subtree: true });
-  // Check if it's already there (e.g. game was already over on load).
-  if (document.querySelector('[aria-label="Results"]')) _uploadScore();
-  console.log('[' + gameTag + '] results modal observer installed');
+  // 4x3: hook showResult — only upload when won=true (game actually finished).
+  const _hookShowResult = () => {
+    if (typeof window.showResult !== 'function') { setTimeout(_hookShowResult, 200); return; }
+    const _origShowResult = window.showResult;
+    window.showResult = function(won, score, fancy, quiet) {
+      _origShowResult.apply(this, arguments);
+      if (!won || window.__uploadedResult || !inDiscord || !authenticatedUserId) return;
+      window.__uploadedResult = true;
+      try {
+        window.drawShareCard().toBlob(async blob => {
+          if (!blob) return;
+          const formData = new FormData();
+          formData.append('image', blob, 'result.png');
+          formData.append('user_id', authenticatedUserId);
+          if (window.discordSdk && window.discordSdk.channelId) {
+            formData.append('channel_id', window.discordSdk.channelId);
+          }
+          try { formData.append('text_result', window.resultDescription()); } catch(err) {}
+          if (window.__puzzleLink) { formData.append('puzzle_link', window.__puzzleLink); }
+          const res = await fetch('api/result', { method: 'POST', body: formData });
+          if (res.ok) {
+            if (typeof window.toast === 'function') window.toast("Score shared to chat!", 3000);
+          } else {
+            if (typeof window.toast === 'function') window.toast("Start game with /play4x3 to auto-share!", 4000);
+          }
+        });
+      } catch (e) { console.error('Upload failed', e); }
+    };
+  };
+  _hookShowResult();
 }
