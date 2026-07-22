@@ -54,3 +54,14 @@ if (inDiscord) {
 } else {
   console.log('[launcher] Running outside Discord');
 }
+
+// Intercept the GitHub link — Discord's CSP blocks normal <a> navigation.
+const ghLink = document.getElementById('ghLink');
+if (ghLink) {
+  ghLink.addEventListener('click', (e) => {
+    e.preventDefault();
+    if (window.discordSdk && window.discordSdk.commands && window.discordSdk.commands.openExternalLink) {
+      window.discordSdk.commands.openExternalLink({ url: ghLink.href });
+    }
+  });
+}

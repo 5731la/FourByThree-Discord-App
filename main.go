@@ -929,7 +929,7 @@ func main() {
   <div class="spinner"></div>
   <h1>FourByThree</h1>
   <p>Loading game…</p>
-  <a href="https://github.com/5731la/FourByThree-Discord-App" target="_blank" rel="noopener">View on GitHub</a>
+  <a id="ghLink" href="https://github.com/5731la/FourByThree-Discord-App">View on GitHub</a>
 </div>
 ` + parentScript + `</body></html>`))
 	})
