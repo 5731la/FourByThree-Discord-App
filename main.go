@@ -860,8 +860,10 @@ func main() {
 		return nil
 	}
 	fourbythreeGameHandler := func(w http.ResponseWriter, r *http.Request) {
-		r.URL.Path = strings.TrimPrefix(r.URL.Path, "/fourbythree/fourbythree")
-		r.URL.RawPath = strings.TrimPrefix(r.URL.RawPath, "/fourbythree/fourbythree")
+		// Strip only the Discord prefix (the first /fourbythree).
+		// The second /fourbythree is the game's own path on hankgreen.com.
+		r.URL.Path = strings.TrimPrefix(r.URL.Path, "/fourbythree")
+		r.URL.RawPath = strings.TrimPrefix(r.URL.RawPath, "/fourbythree")
 		r.Host = ""
 		log.Printf("[fourbythree-proxy] → https://www.hankgreen.com%s", r.URL.Path)
 		fourbythreeProxy.ServeHTTP(w, r)
