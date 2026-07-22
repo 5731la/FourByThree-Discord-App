@@ -21,13 +21,13 @@ if (inDiscord) {
   if (!authenticatedUserId) {
     try {
       const { DiscordSDK } = await import('/static/index.mjs');
-      const sdk = new DiscordSDK({{.ClientID}});
+      const sdk = new DiscordSDK("{{.ClientID}}");
       window.discordSdk = sdk;
       await sdk.ready();
       console.log('[' + gameTag + '] Discord SDK ready');
 
       const { code } = await sdk.commands.authorize({
-        client_id: {{.ClientID}},
+        client_id: "{{.ClientID}}",
         response_type: 'code',
         prompt: 'none',
         scope: ['identify']

@@ -138,7 +138,7 @@ func renderJS(path string, clientID string) string {
 	if err := tmpl.Execute(&buf, struct{ ClientID string }{ClientID: clientID}); err != nil {
 		panic(fmt.Sprintf("render js %s: %v", path, err))
 	}
-	return "<script>" + buf.String() + "</script>"
+	return "<script type='module' >" + buf.String() + "</script>"
 }
 
 // activeGames maps a Discord user ID to the interaction session
@@ -830,6 +830,45 @@ func main() {
 			proxy.ServeHTTP(w, r)
 		}
 	}
+
+	// /fourbythree/fourbythree/* — double-prefixed path from iframe src="/fourbythree/".
+	// Discord always prepends /fourbythree, so iframe src="/fourbythree/" becomes
+	// /fourbythree/fourbythree/ on the server. Strip the extra prefix before forwarding.
+	fourbythreeProxy := httputil.NewSingleHostReverseProxy(target)
+	fourbythreeProxy.Transport = followRedirectsTransport{}
+	fourbythreeProxy.ModifyResponse = func(resp *http.Response) error {
+		resp.Header.Del("X-Frame-Options")
+		resp.Header.Del("Content-Security-Policy")
+		resp.Header.Del("Content-Security-Policy-Report-Only")
+		resp.Header.Set("Access-Control-Allow-Origin", "*")
+		ct := resp.Header.Get("Content-Type")
+		if resp.StatusCode == http.StatusOK && strings.Contains(ct, "text/html") {
+			body, err := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if err != nil {
+				return err
+			}
+			// Inject the unified SDK script for game pages.
+			modified := bytes.Replace(body, []byte("</body>"), []byte(sdkScript+"\n</body>"), 1)
+			modified = cspMetaRe.ReplaceAll(modified, nil)
+			modified = inlineEventsRe.ReplaceAll(modified, []byte(`data-$1=$2`))
+			resp.Body = io.NopCloser(bytes.NewReader(modified))
+			resp.ContentLength = int64(len(modified))
+			resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(modified)))
+			resp.Header.Del("Transfer-Encoding")
+		}
+		return nil
+	}
+	fourbythreeGameHandler := func(w http.ResponseWriter, r *http.Request) {
+		r.URL.Path = strings.TrimPrefix(r.URL.Path, "/fourbythree/fourbythree")
+		r.URL.RawPath = strings.TrimPrefix(r.URL.RawPath, "/fourbythree/fourbythree")
+		r.Host = ""
+		log.Printf("[fourbythree-proxy] → https://www.hankgreen.com%s", r.URL.Path)
+		fourbythreeProxy.ServeHTTP(w, r)
+	}
+	// Register before the catch-all /fourbythree/ so this takes priority.
+	mux.HandleFunc("/fourbythree/fourbythree/", fourbythreeGameHandler)
+	mux.HandleFunc("/fourbythree/fourbythree", fourbythreeGameHandler)
 
 	// /fourbythree/* — the game itself and its assets (puzzles.json, images, etc.)
 	mux.HandleFunc("/fourbythree/", proxyHandler(""))
