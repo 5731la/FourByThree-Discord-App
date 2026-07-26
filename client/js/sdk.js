@@ -169,8 +169,10 @@ if (isSmush) {
 
 // === Footer "Share to Discord" button (no daily guard — for re-entry after timeout) ===
 const _addShareButton = () => {
+  if (window.__shareButtonAdded) return;
   const footLinks = document.querySelector('.foot-links');
   if (!footLinks) return;
+  window.__shareButtonAdded = true;
   const btn = document.createElement('a');
   btn.textContent = 'Share to Discord';
   btn.style.cursor = 'pointer';
