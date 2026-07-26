@@ -88,12 +88,13 @@ _patchArrowOnclicks();
 document.addEventListener('DOMContentLoaded', _patchArrowOnclicks);
 new MutationObserver(_patchArrowOnclicks).observe(document.documentElement, { childList: true, subtree: true });
 
-// Game-specific completion hook.
-const _uploadScore = async () => {
-  const todayKey = gameTag + '_uploaded_' + new Date().toDateString();
-  if (window['__' + gameTag + 'Uploaded'] || !inDiscord || !authenticatedUserId || localStorage.getItem(todayKey)) return;
-  window['__' + gameTag + 'Uploaded'] = true;
-  localStorage.setItem(todayKey, '1');
+// === Core share function — posts score image to Discord via the Go proxy. ===
+// Used by _uploadScore (with daily guard), the 4x3 showResult hook, and the footer button.
+const _postScoreToDiscord = async () => {
+  if (!authenticatedUserId) {
+    console.warn('[' + gameTag + '] Not authenticated');
+    return;
+  }
   try {
     const canvas = typeof window.drawShareCard === 'function' ? window.drawShareCard() : null;
     if (!canvas) { console.error('[' + gameTag + '] drawShareCard not available'); return; }
@@ -106,16 +107,29 @@ const _uploadScore = async () => {
         formData.append('channel_id', window.discordSdk.channelId);
       }
       try {
-        formData.append('text_result', typeof window.shareText === 'function' ? window.shareText() : (typeof window.resultDescription === 'function' ? window.resultDescription() : ''));
+        formData.append('text_result',
+          typeof window.shareText === 'function' ? window.shareText() :
+          (typeof window.resultDescription === 'function' ? window.resultDescription() : ''));
       } catch(e) {}
+      if (window.__puzzleLink) { formData.append('puzzle_link', window.__puzzleLink); }
       const res = await fetch('api/result', { method: 'POST', body: formData });
       if (res.ok) {
         console.log('[' + gameTag + '] Score shared to chat!');
+        if (typeof window.toast === 'function') window.toast("Score shared to chat!", 3000);
       } else {
         console.warn('[' + gameTag + '] Share failed');
       }
     });
   } catch(e) { console.error('[' + gameTag + '] Upload failed', e); }
+};
+
+// === Auto-upload with daily guard (called by game completion observers) ===
+const _uploadScore = async () => {
+  const todayKey = gameTag + '_uploaded_' + new Date().toDateString();
+  if (window['__' + gameTag + 'Uploaded'] || !inDiscord || !authenticatedUserId || localStorage.getItem(todayKey)) return;
+  window['__' + gameTag + 'Uploaded'] = true;
+  localStorage.setItem(todayKey, '1');
+  await _postScoreToDiscord();
 };
 
 if (isSmush) {
@@ -138,7 +152,6 @@ if (isSmush) {
   // 4x3: hook showResult — only upload once per game.
   // Set __uploadedResult = true BEFORE the async toBlob call to block
   // rapid successive showResult() calls that can race the flag.
-  // Also set localStorage so a page reload won't re-upload.
   const _hookShowResult = () => {
     if (typeof window.showResult !== 'function') { setTimeout(_hookShowResult, 200); return; }
     const _origShowResult = window.showResult;
@@ -148,26 +161,24 @@ if (isSmush) {
       if (window.__uploadedResult || localStorage.getItem(todayKey) || !inDiscord || !authenticatedUserId) return;
       window.__uploadedResult = true;
       localStorage.setItem(todayKey, '1');
-      try {
-        window.drawShareCard().toBlob(async blob => {
-          if (!blob) return;
-          const formData = new FormData();
-          formData.append('image', blob, 'result.png');
-          formData.append('user_id', authenticatedUserId);
-          if (window.discordSdk && window.discordSdk.channelId) {
-            formData.append('channel_id', window.discordSdk.channelId);
-          }
-          try { formData.append('text_result', window.resultDescription()); } catch(err) {}
-          if (window.__puzzleLink) { formData.append('puzzle_link', window.__puzzleLink); }
-          const res = await fetch('api/result', { method: 'POST', body: formData });
-          if (res.ok) {
-            if (typeof window.toast === 'function') window.toast("Score shared to chat!", 3000);
-          } else {
-            if (typeof window.toast === 'function') window.toast("Start game with /play4x3 to auto-share!", 4000);
-          }
-        });
-      } catch (e) { console.error('Upload failed', e); }
+      _postScoreToDiscord();
     };
   };
   _hookShowResult();
 }
+
+// === Footer "Share to Discord" button (no daily guard — for re-entry after timeout) ===
+const _addShareButton = () => {
+  const footLinks = document.querySelector('.foot-links');
+  if (!footLinks) return;
+  const btn = document.createElement('a');
+  btn.textContent = 'Share to Discord';
+  btn.style.cursor = 'pointer';
+  btn.addEventListener('click', (e) => {
+    e.preventDefault();
+    _postScoreToDiscord();
+  });
+  footLinks.appendChild(btn);
+};
+_addShareButton();
+document.addEventListener('DOMContentLoaded', _addShareButton);
