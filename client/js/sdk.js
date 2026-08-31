@@ -155,9 +155,65 @@ const _resetWarning =
   "If you send your score to Discord chat, it will be posted as:\n\n" +
   "    @you (CHEATER)\n\n" +
   "Reset the board anyway?";
+function _askInPage(message) {
+  // In-page fallback for environments where the browser silently ignores
+  // native dialogs: Discord's activity iframe is sandboxed without
+  // allow-modals, so confirm() returns undefined and nothing is shown.
+  return new Promise((resolve) => {
+    const overlay = document.createElement('div');
+    overlay.id = '__fb3Confirm';
+    overlay.style.cssText =
+      'position:fixed;inset:0;z-index:2147483647;background:rgba(0,0,0,.55);' +
+      'display:flex;align-items:center;justify-content:center;' +
+      'font-family:system-ui,-apple-system,sans-serif;';
+    const box = document.createElement('div');
+    box.style.cssText =
+      'background:#1e1f22;color:#fff;border-radius:12px;padding:24px 28px;' +
+      'max-width:360px;width:calc(100% - 48px);text-align:center;' +
+      'box-shadow:0 8px 32px rgba(0,0,0,.5);';
+    const text = document.createElement('div');
+    text.style.cssText = 'white-space:pre-wrap;font-size:14px;line-height:1.5;margin-bottom:20px;';
+    text.textContent = message;
+    const row = document.createElement('div');
+    row.style.cssText = 'display:flex;gap:12px;justify-content:center;';
+    const mkBtn = (label, css) => {
+      const b = document.createElement('button');
+      b.textContent = label;
+      b.style.cssText =
+        'padding:10px 20px;border:none;border-radius:8px;font-size:14px;' +
+        'font-weight:600;cursor:pointer;' + css;
+      return b;
+    };
+    let _settled = false;
+    const finish = (ok) => {
+      if (_settled) return;
+      _settled = true;
+      overlay.remove();
+      resolve(ok);
+    };
+    const cancelBtn = mkBtn('Cancel', 'background:#4e5058;color:#fff;');
+    const resetBtn = mkBtn('Reset anyway', 'background:#f23f43;color:#fff;');
+    cancelBtn.addEventListener('click', () => finish(false));
+    resetBtn.addEventListener('click', () => finish(true));
+    row.appendChild(cancelBtn);
+    row.appendChild(resetBtn);
+    box.appendChild(text);
+    box.appendChild(row);
+    overlay.appendChild(box);
+    document.body.appendChild(overlay);
+    resetBtn.focus();
+  });
+}
+let _nativeConfirmWorks = null; // null = unknown, true/false = cached probe result
 function confirmCheatReset() {
-  if (typeof window.confirm !== 'function') return true; // best-effort warning
-  return window.confirm(_resetWarning);
+  if (_nativeConfirmWorks !== false) {
+    try {
+      const ok = window.confirm(_resetWarning);
+      if (typeof ok === 'boolean') { _nativeConfirmWorks = true; return Promise.resolve(ok); }
+      _nativeConfirmWorks = false; // sandboxed iframe: the dialog was silently ignored
+    } catch (e) { _nativeConfirmWorks = false; }
+  }
+  return _askInPage(_resetWarning);
 }
 
 if (isSmush) {
@@ -183,19 +239,22 @@ if (isSmush) {
   // rolling window, so our counter tracks the game's. On the click that would
   // trigger the reset we warn first: declining blocks the click before it
   // reaches the game (and re-arms on the next click), accepting sets the cheat
-  // flag and lets the game run its own wipe + reload.
+  // flag. The warning may take a while (in-page modal in Discord), so the
+  // event is always blocked here and, on acceptance, we perform the game's
+  // own reset — wipe save + reload — ourselves.
   let _resetTaps = 0, _resetTapTimer = null;
   document.addEventListener('click', (e) => {
     const t = e.target;
     if (!t || typeof t.closest !== 'function' || !t.closest('#title .logo')) return;
     if (_resetTaps >= 4) {
-      if (!confirmCheatReset()) {
-        e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation();
-        console.warn('[' + gameTag + '] board reset declined — save kept');
-        return;
-      }
-      markCheated(); // the game's own handler now wipes the save + reloads
-      return;        // let the event reach the game's listener
+      e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation();
+      confirmCheatReset().then((ok) => {
+        if (!ok) { console.warn('[' + gameTag + '] board reset declined — save kept'); return; }
+        markCheated();
+        try { localStorage.removeItem(SAVEKEY); } catch (err) {}
+        location.reload();
+      });
+      return;
     }
     _resetTaps++;
     clearTimeout(_resetTapTimer);
@@ -228,12 +287,11 @@ if (isSmush) {
     window.__resetHooked = true;
     const _origReset = window.resetPuzzle;
     window.resetPuzzle = function(...args) {
-      if (!confirmCheatReset()) {
-        console.warn('[' + gameTag + '] puzzle reset declined — progress kept');
-        return;
-      }
-      markCheated();
-      return _origReset.apply(this, args);
+      confirmCheatReset().then((ok) => {
+        if (!ok) { console.warn('[' + gameTag + '] puzzle reset declined — progress kept'); return; }
+        markCheated();
+        _origReset.apply(this, args);
+      });
     };
   };
   _hookResetPuzzle();
