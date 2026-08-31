@@ -279,6 +279,10 @@ if (isSmush) {
     window.__resetHooked = true;
     const _origReset = window.resetPuzzle;
     window.resetPuzzle = function(...args) {
+      // If today's cheat warning was already accepted (e.g. the user opened the
+      // test menu via the logo-tap flow and then clicked "Reset puzzle"), do not
+      // prompt a second time — just perform the reset.
+      if (getCheatedDate()) { _origReset.apply(this, args); return; }
       confirmCheatReset().then((ok) => {
         if (!ok) { console.warn('[' + gameTag + '] puzzle reset declined — progress kept'); return; }
         markCheated();
@@ -287,6 +291,128 @@ if (isSmush) {
     };
   };
   _hookResetPuzzle();
+
+  // Intercept the secret 7-tap logo flow. The game's bubble listener on
+  // header .logo counts 7 taps in a 1.5s window then calls askTestCode(), which
+  // does prompt("") — blocked in Discord's sandboxed iframe (no allow-modals),
+  // so the reset is unreachable there. We mirror the tap counting at the
+  // document level (capture phase), block the 7th tap before it reaches the
+  // game, and replace the native prompt with an in-page code modal. The game's
+  // own "go home" guard for non-daily / beta / community boards is replicated
+  // so we never interfere with the logo's navigation there.
+  const _logoTapGoHome = () => {
+    try {
+      if (isBeta || communityId || (dailyKey && dailyKey !== todayStr())) return true;
+    } catch (_) { /* globals not set yet — treat as a normal daily board */ }
+    return false;
+  };
+  function _askCodeInPage(message) {
+    // In-page replacement for the game's prompt("") — native prompts are
+    // ignored (and logged) in Discord's sandboxed activity iframe.
+    return new Promise((resolve) => {
+      const overlay = document.createElement('div');
+      overlay.id = '__fb3Code';
+      overlay.style.cssText =
+        'position:fixed;inset:0;z-index:2147483647;background:rgba(0,0,0,.55);' +
+        'display:flex;align-items:center;justify-content:center;' +
+        'font-family:system-ui,-apple-system,sans-serif;';
+      const box = document.createElement('div');
+      box.style.cssText =
+        'background:#1e1f22;color:#fff;border-radius:12px;padding:24px 28px;' +
+        'max-width:360px;width:calc(100% - 48px);text-align:center;' +
+        'box-shadow:0 8px 32px rgba(0,0,0,.5);';
+      const text = document.createElement('div');
+      text.style.cssText = 'font-size:14px;line-height:1.5;margin-bottom:16px;';
+      text.textContent = message;
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.autofocus = true;
+      input.setAttribute('autocomplete', 'off');
+      input.setAttribute('spellcheck', 'false');
+      input.style.cssText =
+        'width:100%;box-sizing:border-box;padding:10px 12px;border:1px solid #4e5058;' +
+        'border-radius:8px;background:#2b2d31;color:#fff;font-size:14px;outline:none;margin-bottom:16px;';
+      const row = document.createElement('div');
+      row.style.cssText = 'display:flex;gap:12px;justify-content:center;';
+      const mkBtn = (label, css) => {
+        const b = document.createElement('button');
+        b.textContent = label;
+        b.style.cssText =
+          'padding:10px 20px;border:none;border-radius:8px;font-size:14px;' +
+          'font-weight:600;cursor:pointer;' + css;
+        return b;
+      };
+      let _settled = false;
+      const finish = (value) => {
+        if (_settled) return;
+        _settled = true;
+        overlay.remove();
+        resolve(value);
+      };
+      const ok = () => {
+        const v = input.value.trim().toLowerCase();
+        if (!v) { input.focus(); return; }
+        finish(v);
+      };
+      const cancelBtn = mkBtn('Cancel', 'background:#4e5058;color:#fff;');
+      const okBtn = mkBtn('OK', 'background:#f23f43;color:#fff;');
+      cancelBtn.addEventListener('click', () => finish(null));
+      okBtn.addEventListener('click', ok);
+      input.addEventListener('keydown', (ev) => {
+        if (ev.key === 'Enter') { ev.preventDefault(); ok(); }
+        else if (ev.key === 'Escape') { ev.preventDefault(); finish(null); }
+      });
+      row.appendChild(cancelBtn);
+      row.appendChild(okBtn);
+      box.appendChild(text);
+      box.appendChild(input);
+      box.appendChild(row);
+      overlay.appendChild(box);
+      document.body.appendChild(overlay);
+      input.focus();
+    });
+  }
+  async function _askTestCodeInPage() {
+    // In-page replacement for the game's askTestCode(): same server-side check,
+    // same openTestMenu() on success — but without the sandbox-blocked prompt().
+    const w = (await _askCodeInPage('Enter the test code:')) || '';
+    if (!w) return false;
+    try {
+      const r = await fetch('https://fourbythree-stats.hankmt.workers.dev/testcode', {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain' },
+        body: JSON.stringify({ w }),
+      });
+      const j = await r.json();
+      if (j && j.ok) { window.openTestMenu(); return true; }
+      console.warn('[' + gameTag + '] test code rejected');
+    } catch (err) {
+      console.warn('[' + gameTag + '] test code check failed', err);
+    }
+    return false;
+  }
+  let _logoTaps = 0, _logoTapTimer = null;
+  document.addEventListener('click', (e) => {
+    const t = e.target;
+    if (!t || typeof t.closest !== 'function' || !t.closest('header .logo')) return;
+    // Non-daily / beta / community boards: the logo click "goes home" instead
+    // of counting taps — don't intercept that navigation.
+    if (_logoTapGoHome()) return;
+    if (_logoTaps >= 6) {
+      e.preventDefault();
+      e.stopPropagation();
+      e.stopImmediatePropagation();
+      _logoTaps = 0;
+      confirmCheatReset().then((ok) => {
+        if (!ok) { console.warn('[' + gameTag + '] test menu declined'); return; }
+        _askTestCodeInPage();
+      });
+      return;
+    }
+    _logoTaps++;
+    clearTimeout(_logoTapTimer);
+    _logoTapTimer = setTimeout(() => { _logoTaps = 0; }, 1500);
+  }, true);
 }
 
 // === Footer "Share to Discord" button (no daily guard — for re-entry after timeout) ===
