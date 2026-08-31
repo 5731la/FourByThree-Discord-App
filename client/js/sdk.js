@@ -156,9 +156,9 @@ const _resetWarning =
   "    @you (CHEATER)\n\n" +
   "Reset the board anyway?";
 function _askInPage(message) {
-  // In-page fallback for environments where the browser silently ignores
-  // native dialogs: Discord's activity iframe is sandboxed without
-  // allow-modals, so confirm() returns undefined and nothing is shown.
+  // Discord's activity iframe is sandboxed without allow-modals: native
+  // dialogs (confirm/alert) are silently ignored and log an error, so the
+  // warning is always shown as an in-page modal.
   return new Promise((resolve) => {
     const overlay = document.createElement('div');
     overlay.id = '__fb3Confirm';
@@ -204,15 +204,7 @@ function _askInPage(message) {
     resetBtn.focus();
   });
 }
-let _nativeConfirmWorks = null; // null = unknown, true/false = cached probe result
 function confirmCheatReset() {
-  if (_nativeConfirmWorks !== false) {
-    try {
-      const ok = window.confirm(_resetWarning);
-      if (typeof ok === 'boolean') { _nativeConfirmWorks = true; return Promise.resolve(ok); }
-      _nativeConfirmWorks = false; // sandboxed iframe: the dialog was silently ignored
-    } catch (e) { _nativeConfirmWorks = false; }
-  }
   return _askInPage(_resetWarning);
 }
 
