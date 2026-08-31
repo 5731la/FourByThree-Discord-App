@@ -623,6 +623,10 @@ func main() {
 		}
 
 		content := fmt.Sprintf("<@%s> finished their 4\u00d73 game!", userID)
+		if r.FormValue("cheated") != "" {
+			log.Printf("[cheat] user %s posted a cheated 4x3 score", userID)
+			content = fmt.Sprintf("<@%s> (CHEATER)", userID)
+		}
 		if err := createFollowupMessage(session.AppID, session.Token, userID, textResult, puzzleLink, content, imgBlob); err != nil {
 			log.Printf("Failed to create followup message: %v", err)
 			http.Error(w, "failed to post", 500)
@@ -759,6 +763,10 @@ func main() {
 			return
 		}
 		content := fmt.Sprintf("<@%s> finished today's Smush!", userID)
+		if r.FormValue("cheated") != "" {
+			log.Printf("[cheat] user %s posted a cheated smush score", userID)
+			content = fmt.Sprintf("<@%s> (CHEATER)", userID)
+		}
 		if err := createFollowupMessage(session.AppID, session.Token, userID, textResult, "", content, imgBlob); err != nil {
 			log.Printf("[smush] Failed to post followup: %v (content would have been: %s)", err, content)
 			http.Error(w, "failed to post", 500)

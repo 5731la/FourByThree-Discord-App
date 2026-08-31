@@ -112,6 +112,8 @@ const _postScoreToDiscord = async () => {
           (typeof window.resultDescription === 'function' ? window.resultDescription() : ''));
       } catch(e) {}
       if (window.__puzzleLink) { formData.append('puzzle_link', window.__puzzleLink); }
+      const _cheatedDate = getCheatedDate();
+      if (_cheatedDate) { formData.append('cheated', _cheatedDate); }
       const res = await fetch('api/result', { method: 'POST', body: formData });
       if (res.ok) {
         console.log('[' + gameTag + '] Score shared to chat!');
@@ -132,6 +134,32 @@ const _uploadScore = async () => {
   await _postScoreToDiscord();
 };
 
+// === Cheating flag ===
+// Resetting the board (smush: 5 quick logo clicks; 4x3: the secret key combo
+// or the hidden test menu) is not a legitimate play. When it happens we tag
+// today's game as cheated under a key mirroring the daily upload guard above,
+// after warning the user. _postScoreToDiscord sends the tag along, and the Go
+// proxy then posts the score to Discord as "<@user> (CHEATER)".
+function getCheatedDate() {
+  const key = gameTag + '_cheated_' + new Date().toDateString();
+  try { return localStorage.getItem(key) || ''; } catch (e) { return ''; }
+}
+function markCheated() {
+  const key = gameTag + '_cheated_' + new Date().toDateString();
+  try { localStorage.setItem(key, new Date().toDateString()); } catch (e) {}
+}
+const _resetWarning =
+  "Cheating warning\n\n" +
+  "Resetting the board means today's " + (isSmush ? 'Smush' : '4\u00d73') +
+  " run is not a legitimate play.\n\n" +
+  "If you send your score to Discord chat, it will be posted as:\n\n" +
+  "    @you (CHEATER)\n\n" +
+  "Reset the board anyway?";
+function confirmCheatReset() {
+  if (typeof window.confirm !== 'function') return true; // best-effort warning
+  return window.confirm(_resetWarning);
+}
+
 if (isSmush) {
   // Smush: observe #finalScore in #mbody (game over modal container).
   const _smushObserver = new MutationObserver(() => {
@@ -148,6 +176,31 @@ if (isSmush) {
     _smushObserver.observe(document.body, { childList: true, subtree: true });
   }
   console.log('[' + gameTag + '] gameOver observer installed');
+
+  // Intercept the secret reset: 5 quick clicks on #title .logo. The game
+  // counts its own clicks in a bubble listener on the logo element; we count
+  // the same clicks at document level (capture phase) with the same 1.5s
+  // rolling window, so our counter tracks the game's. On the click that would
+  // trigger the reset we warn first: declining blocks the click before it
+  // reaches the game (and re-arms on the next click), accepting sets the cheat
+  // flag and lets the game run its own wipe + reload.
+  let _resetTaps = 0, _resetTapTimer = null;
+  document.addEventListener('click', (e) => {
+    const t = e.target;
+    if (!t || typeof t.closest !== 'function' || !t.closest('#title .logo')) return;
+    if (_resetTaps >= 4) {
+      if (!confirmCheatReset()) {
+        e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation();
+        console.warn('[' + gameTag + '] board reset declined — save kept');
+        return;
+      }
+      markCheated(); // the game's own handler now wipes the save + reloads
+      return;        // let the event reach the game's listener
+    }
+    _resetTaps++;
+    clearTimeout(_resetTapTimer);
+    _resetTapTimer = setTimeout(() => { _resetTaps = 0; }, 1500);
+  }, true);
 } else {
   // 4x3: hook showResult — only upload once per game.
   // Set __uploadedResult = true BEFORE the async toBlob call to block
@@ -165,6 +218,25 @@ if (isSmush) {
     };
   };
   _hookShowResult();
+
+  // Intercept the secret reset: the up/up/down/down/up/up key combo and the
+  // hidden test menu's "Reset puzzle" button both call the global
+  // resetPuzzle(), so wrapping that single choke point covers both.
+  const _hookResetPuzzle = () => {
+    if (typeof window.resetPuzzle !== 'function') { setTimeout(_hookResetPuzzle, 200); return; }
+    if (window.__resetHooked) return;
+    window.__resetHooked = true;
+    const _origReset = window.resetPuzzle;
+    window.resetPuzzle = function(...args) {
+      if (!confirmCheatReset()) {
+        console.warn('[' + gameTag + '] puzzle reset declined — progress kept');
+        return;
+      }
+      markCheated();
+      return _origReset.apply(this, args);
+    };
+  };
+  _hookResetPuzzle();
 }
 
 // === Footer "Share to Discord" button (no daily guard — for re-entry after timeout) ===
