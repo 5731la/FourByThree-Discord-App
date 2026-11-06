@@ -906,6 +906,10 @@ func main() {
 	
 	mux.HandleFunc("/fourbythree/assets/", assetProxyHandler)
 	mux.HandleFunc("/fourbythree/assets", assetProxyHandler)
+	// The game HTML references sentry.js relative to /fourbythree/ (../sentry.js),
+	// so in Discord it arrives at /fourbythree/sentry.js — which the /fourbythree/
+	// launcher subtree would otherwise answer with launcher HTML. Forward it.
+	mux.HandleFunc("/fourbythree/sentry.js", assetProxyHandler)
 
 	// Serve the Discord SDK and other static assets from client/static/.
 	staticFS, err := fs.Sub(staticFiles, "client/static")
