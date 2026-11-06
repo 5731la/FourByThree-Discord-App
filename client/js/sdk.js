@@ -20,7 +20,7 @@ if (inDiscord) {
   // Slow path: direct load without parent.
   if (!authenticatedUserId) {
     try {
-      const { DiscordSDK } = await import('/static/index.mjs');
+      const { DiscordSDK } = await import('/static/index.mjs?{{.CacheBust}}');
       const sdk = new DiscordSDK("{{.ClientID}}");
       window.discordSdk = sdk;
       await sdk.ready();

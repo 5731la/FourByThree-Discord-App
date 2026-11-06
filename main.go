@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"text/template"
@@ -34,6 +35,52 @@ var cspMetaRe = regexp.MustCompile(`(?i)<meta[^>]+http-equiv=["']?Content-Securi
 // NOTE: unquoted values (e.g. onclick=()=>fn()) are intentionally left alone because the
 // '>' in '=>' is indistinguishable from an HTML close-tag, so regex rewriting corrupts the JS.
 var inlineEventsRe = regexp.MustCompile(`(?i)\b(on(?:click|keydown|input|error|load|change|submit))=(["'][^"']*["'])`)
+
+// cacheBustParam is unique per server run (this process's PID) and is
+// appended as a query to every JS import in the game page HTML, so that
+// each server run busts Discord's cache of those bundles.
+var cacheBustParam = "v=" + strconv.Itoa(os.Getpid())
+
+// jsImportRe matches the JS imports a game page loads: the <script ... src>
+// entry tag and the <link rel="modulepreload" ... href> /
+// <link rel="preload" as="script" ... href> links (either quote style).
+var jsImportRe = regexp.MustCompile(`(?i)` +
+	`<script\b[^>]*\bsrc\s*=\s*["']([^"']+)["']` +
+	`|<link\b[^>]*rel\s*=\s*["']modulepreload["'][^>]*\bhref\s*=\s*["']([^"']+)["']` +
+	`|<link\b[^>]*rel\s*=\s*["']preload["'][^>]*as\s*=\s*["']script["'][^>]*\bhref\s*=\s*["']([^"']+)["']`)
+
+// cacheBustJS appends "?v=<pid>" (see cacheBustParam) to every JS import URL
+// in the page HTML, so Discord's proxy never serves a stale bundle cached
+// under a URL from an earlier server run. URLs that already carry a query or
+// fragment are left untouched.
+func cacheBustJS(body []byte) []byte {
+	s := string(body)
+	var out strings.Builder
+	out.Grow(len(s) + 256)
+	last := 0
+	for _, m := range jsImportRe.FindAllStringSubmatchIndex(s, -1) {
+		urlStart, urlEnd := -1, -1
+		for i := 2; i < len(m); i += 2 {
+			if m[i] != -1 {
+				urlStart, urlEnd = m[i], m[i+1]
+				break
+			}
+		}
+		if urlStart == -1 {
+			continue
+		}
+		out.WriteString(s[last:urlStart])
+		u := s[urlStart:urlEnd]
+		if strings.ContainsAny(u, "?#") {
+			out.WriteString(u)
+		} else {
+			out.WriteString(u + "?" + cacheBustParam)
+		}
+		last = urlEnd
+	}
+	out.WriteString(s[last:])
+	return []byte(out.String())
+}
 
 // upstreamTransport is used for all requests to hankgreen.com.
 //
@@ -130,12 +177,17 @@ func readJS(path string) string {
 	return string(b)
 }
 
-// renderJS renders a JS template with {{.ClientID}} substitution.
+// renderJS renders a JS template with {{.ClientID}} and {{.CacheBust}}
+// substitution (the per-run cache-buster, see cacheBustParam).
 func renderJS(path string, clientID string) string {
 	src := readJS(path)
 	tmpl := template.Must(template.New(path).Parse(src))
 	var buf strings.Builder
-	if err := tmpl.Execute(&buf, struct{ ClientID string }{ClientID: clientID}); err != nil {
+	data := struct {
+		ClientID  string
+		CacheBust string
+	}{ClientID: clientID, CacheBust: cacheBustParam}
+	if err := tmpl.Execute(&buf, data); err != nil {
 		panic(fmt.Sprintf("render js %s: %v", path, err))
 	}
 	return "<script type='module' >" + buf.String() + "</script>"
@@ -308,6 +360,9 @@ func main() {
 			// Rewrite inline event handlers (onclick="..." -> data-onclick="...")
 			// so they bypass Discord's strict CSP blocking 'unsafe-inline'.
 			modified = inlineEventsRe.ReplaceAll(modified, []byte(`data-$1=$2`))
+
+			// Cache-bust JS imports (?v=<pid>) so Discord never serves stale bundles.
+			modified = cacheBustJS(modified)
 
 			resp.Body = io.NopCloser(bytes.NewReader(modified))
 			resp.ContentLength = int64(len(modified))
@@ -667,6 +722,8 @@ func main() {
 				modified = bytes.Replace(modified, []byte("</body>"), []byte(sdkScript+"\n</body>"), 1)
 				modified = cspMetaRe.ReplaceAll(modified, nil)
 				modified = inlineEventsRe.ReplaceAll(modified, []byte(`data-$1=$2`))
+				// Cache-bust JS imports (?v=<pid>) so Discord never serves stale bundles.
+				modified = cacheBustJS(modified)
 			}
 			resp.Body = io.NopCloser(bytes.NewReader(modified))
 			resp.ContentLength = int64(len(modified))
@@ -916,6 +973,9 @@ func main() {
 			// Rewrite inline event handlers (onclick="..." -> data-onclick="...")
 			// so they bypass Discord's strict CSP blocking 'unsafe-inline'.
 			modified = inlineEventsRe.ReplaceAll(modified, []byte(`data-$1=$2`))
+
+			// Cache-bust JS imports (?v=<pid>) so Discord never serves stale bundles.
+			modified = cacheBustJS(modified)
 
 			resp.Body = io.NopCloser(bytes.NewReader(modified))
 			resp.ContentLength = int64(len(modified))

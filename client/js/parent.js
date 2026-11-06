@@ -5,7 +5,7 @@ const inDiscord = new URLSearchParams(window.location.search).has('frame_id');
 let authenticatedUserId = null;
 
 if (inDiscord) {
-  const { DiscordSDK } = await import('/static/index.mjs');
+  const { DiscordSDK } = await import('/static/index.mjs?{{.CacheBust}}');
   const sdk = new DiscordSDK("{{.ClientID}}");
   window.discordSdk = sdk;
   await sdk.ready();
