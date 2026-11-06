@@ -813,6 +813,28 @@ func main() {
 		log.Printf("[worker-proxy] → https://fourbythree-stats.hankmt.workers.dev%s", r.URL.Path)
 		workerProxy.ServeHTTP(w, r)
 	}
+	
+
+	assetTarget, _ := url.Parse("https://www.hankgreen.com")
+	assetProxy := httputil.NewSingleHostReverseProxy(assetTarget)
+	assetProxy.Transport = followRedirectsTransport{}
+	assetProxy.ModifyResponse = func(resp *http.Response) error {
+		log.Printf("[asset-proxy] upstream %s %s → %d", resp.Request.Method, resp.Request.URL, resp.StatusCode)
+		resp.Header.Set("Access-Control-Allow-Origin", "*")
+		return nil
+	}
+	assetProxyHandler := func(w http.ResponseWriter, r *http.Request) {
+		for _, pfx := range []string{"/fourbythree/", "/smush/"} {
+			r.URL.Path = strings.TrimPrefix(r.URL.Path, pfx)
+			r.URL.RawPath = strings.TrimPrefix(r.URL.RawPath, pfx)
+		}
+		if r.URL.Path == "" {
+			r.URL.Path = "/"
+		}
+		r.Host = ""
+		log.Printf("[asset-proxy] → %s%s",assetTarget, r.URL.Path)
+		assetProxy.ServeHTTP(w, r)
+	}
 	// Register before /fourbythree/smush/ so the more-specific pattern wins.
 	mux.HandleFunc("/fourbythree/smush/workerproxy/", workerProxyHandler)
 	mux.HandleFunc("/fourbythree/smush/workerproxy", workerProxyHandler)
@@ -824,6 +846,9 @@ func main() {
 	// Discord's portal prefixes every path with /fourbythree, so /smush/ arrives as /fourbythree/smush/
 	mux.HandleFunc("/fourbythree/smush/", smushGameHandler)
 	mux.HandleFunc("/fourbythree/smush", smushGameHandler)
+	
+	mux.HandleFunc("/fourbythree/assets/", assetProxyHandler)
+	mux.HandleFunc("/fourbythree/assets", assetProxyHandler)
 
 	// Serve the Discord SDK and other static assets from client/static/.
 	staticFS, err := fs.Sub(staticFiles, "client/static")
