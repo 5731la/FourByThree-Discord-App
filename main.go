@@ -16,6 +16,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -80,6 +81,63 @@ func cacheBustJS(body []byte) []byte {
 	}
 	out.WriteString(s[last:])
 	return []byte(out.String())
+}
+
+// jsImportSpecRe matches relative ESM module specifiers inside JS source —
+// the string right after a side-effect `import`, a `from` clause (covers
+// `import ... from` and `export ... from`), or a dynamic `import(` call.
+// Only `./` / `../` specifiers are matched, so absolute URLs, bare package
+// names, and non-import strings are untouched. Specifiers that already carry
+// a query or fragment cannot match (the char class stops at `?`/`#`), which
+// keeps the rewrite idempotent.
+var jsImportSpecRe = regexp.MustCompile(`(\bimport\b\s*|\bfrom\s*|\bimport\(\s*)["'](\.{1,2}/[^"'\s?#]+)["']`)
+
+// cacheBustJSImports appends "?v=<pid>" (see cacheBustParam) to every relative
+// module specifier in a JS body, so bundles imported *from inside* other
+// bundles also carry the per-run cache-bust query. (cacheBustJS above does the
+// same for script/preload tags in HTML; this one operates on JS source.)
+func cacheBustJSImports(body []byte) []byte {
+	s := string(body)
+	var out strings.Builder
+	out.Grow(len(s) + 256)
+	last := 0
+	for _, m := range jsImportSpecRe.FindAllStringSubmatchIndex(s, -1) {
+		specStart, specEnd := m[4], m[5]
+		if specStart == -1 {
+			continue
+		}
+		out.WriteString(s[last:specStart])
+		spec := s[specStart:specEnd]
+		if strings.ContainsAny(spec, "?#") {
+			out.WriteString(spec)
+		} else {
+			out.WriteString(spec + "?" + cacheBustParam)
+		}
+		last = specEnd
+	}
+	out.WriteString(s[last:])
+	return []byte(out.String())
+}
+
+// cacheBustJSResponse rewrites a JS response body in place (module specifiers
+// get the per-run cache-bust query). Non-JS responses pass through untouched.
+func cacheBustJSResponse(resp *http.Response) error {
+	ct := resp.Header.Get("Content-Type")
+	if resp.StatusCode != http.StatusOK ||
+		!strings.Contains(ct, "javascript") && !strings.Contains(ct, "ecmascript") {
+		return nil
+	}
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		return err
+	}
+	modified := cacheBustJSImports(body)
+	resp.Body = io.NopCloser(bytes.NewReader(modified))
+	resp.ContentLength = int64(len(modified))
+	resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(modified)))
+	resp.Header.Del("Transfer-Encoding")
+	return nil
 }
 
 // upstreamTransport is used for all requests to hankgreen.com.
@@ -191,6 +249,63 @@ func renderJS(path string, clientID string) string {
 		panic(fmt.Sprintf("render js %s: %v", path, err))
 	}
 	return "<script type='module' >" + buf.String() + "</script>"
+}
+
+// bufferRW captures a response body so it can be rewritten before being
+// flushed to the client.
+type bufferRW struct {
+	http.ResponseWriter
+	header http.Header
+	body   bytes.Buffer
+	status int
+}
+
+func (b *bufferRW) Header() http.Header {
+	if b.header == nil {
+		b.header = make(http.Header)
+	}
+	return b.header
+}
+
+func (b *bufferRW) Write(p []byte) (int, error) {
+	if b.status == 0 {
+		b.status = http.StatusOK
+	}
+	return b.body.Write(p)
+}
+
+// cacheBustStaticJS wraps a static file server and rewrites relative module
+// specifiers inside .js/.mjs/.cjs responses. The vendored Discord SDK tree
+// has stable (unhashed) filenames, so without this it can be served stale by
+// Discord's proxy across deploys. Non-JS files and non-200 responses pass
+// through unmodified.
+func cacheBustStaticJS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ext := strings.ToLower(filepath.Ext(r.URL.Path))
+		if ext != ".js" && ext != ".mjs" && ext != ".cjs" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		bw := &bufferRW{ResponseWriter: w}
+		next.ServeHTTP(bw, r)
+		if bw.status == 0 {
+			bw.status = http.StatusOK
+		}
+		for k, vv := range bw.header {
+			for _, v := range vv {
+				w.Header().Add(k, v)
+			}
+		}
+		if bw.status != http.StatusOK {
+			w.WriteHeader(bw.status)
+			w.Write(bw.body.Bytes())
+			return
+		}
+		modified := cacheBustJSImports(bw.body.Bytes())
+		w.Header().Set("Content-Length", strconv.Itoa(len(modified)))
+		w.WriteHeader(bw.status)
+		w.Write(modified)
+	})
 }
 
 // activeGames maps a Discord user ID to the interaction session
@@ -371,7 +486,8 @@ func main() {
 			resp.Header.Del("Transfer-Encoding")
 		}
 
-		return nil
+		// Non-HTML (e.g. JS bundles): bust relative module specifiers.
+		return cacheBustJSResponse(resp)
 	}
 
 	mux := http.NewServeMux()
@@ -725,6 +841,10 @@ func main() {
 				// Cache-bust JS imports (?v=<pid>) so Discord never serves stale bundles.
 				modified = cacheBustJS(modified)
 			}
+			if isJS {
+				// Bust relative module specifiers inside the bundle too.
+				modified = cacheBustJSImports(modified)
+			}
 			resp.Body = io.NopCloser(bytes.NewReader(modified))
 			resp.ContentLength = int64(len(modified))
 			resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(modified)))
@@ -870,7 +990,6 @@ func main() {
 		log.Printf("[worker-proxy] → https://fourbythree-stats.hankmt.workers.dev%s", r.URL.Path)
 		workerProxy.ServeHTTP(w, r)
 	}
-	
 
 	assetTarget, _ := url.Parse("https://www.hankgreen.com")
 	assetProxy := httputil.NewSingleHostReverseProxy(assetTarget)
@@ -878,7 +997,8 @@ func main() {
 	assetProxy.ModifyResponse = func(resp *http.Response) error {
 		log.Printf("[asset-proxy] upstream %s %s → %d", resp.Request.Method, resp.Request.URL, resp.StatusCode)
 		resp.Header.Set("Access-Control-Allow-Origin", "*")
-		return nil
+		// Bust relative module specifiers inside JS bundles (?v=<pid>).
+		return cacheBustJSResponse(resp)
 	}
 	assetProxyHandler := func(w http.ResponseWriter, r *http.Request) {
 		for _, pfx := range []string{"/fourbythree/", "/smush/"} {
@@ -889,7 +1009,7 @@ func main() {
 			r.URL.Path = "/"
 		}
 		r.Host = ""
-		log.Printf("[asset-proxy] → %s%s",assetTarget, r.URL.Path)
+		log.Printf("[asset-proxy] → %s%s", assetTarget, r.URL.Path)
 		assetProxy.ServeHTTP(w, r)
 	}
 	// Register before /fourbythree/smush/ so the more-specific pattern wins.
@@ -903,7 +1023,7 @@ func main() {
 	// Discord's portal prefixes every path with /fourbythree, so /smush/ arrives as /fourbythree/smush/
 	mux.HandleFunc("/fourbythree/smush/", smushGameHandler)
 	mux.HandleFunc("/fourbythree/smush", smushGameHandler)
-	
+
 	mux.HandleFunc("/fourbythree/assets/", assetProxyHandler)
 	mux.HandleFunc("/fourbythree/assets", assetProxyHandler)
 	// The game HTML references sentry.js relative to /fourbythree/ (../sentry.js),
@@ -916,9 +1036,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("static fs error: %v", err)
 	}
-	mux.Handle("/fourbythree/static/", http.StripPrefix("/fourbythree/static/", http.FileServer(http.FS(staticFS))))
+	mux.Handle("/fourbythree/static/", http.StripPrefix("/fourbythree/static/", cacheBustStaticJS(http.FileServer(http.FS(staticFS)))))
 	// Smush also needs the Discord SDK — serve it under /smush/static/ too.
-	mux.Handle("/smush/static/", http.StripPrefix("/smush/static/", http.FileServer(http.FS(staticFS))))
+	mux.Handle("/smush/static/", http.StripPrefix("/smush/static/", cacheBustStaticJS(http.FileServer(http.FS(staticFS)))))
 
 	// proxyHandler strips a path prefix then forwards to hankgreen.com.
 	proxyHandler := func(stripPrefix string) http.HandlerFunc {
@@ -987,7 +1107,8 @@ func main() {
 			// Remove transfer-encoding so the fixed Content-Length is authoritative.
 			resp.Header.Del("Transfer-Encoding")
 		}
-		return nil
+		// Non-HTML (e.g. JS bundles): bust relative module specifiers.
+		return cacheBustJSResponse(resp)
 	}
 	fourbythreeGameHandler := func(w http.ResponseWriter, r *http.Request) {
 		// Strip only the Discord prefix (the first /fourbythree).
