@@ -274,6 +274,14 @@ func (b *bufferRW) Write(p []byte) (int, error) {
 	return b.body.Write(p)
 }
 
+// WriteHeader records the status without flushing — the embedded
+// ResponseWriter must not be written to before the wrapper has copied and
+// amended the captured headers, or they are sent early (and later
+// modifications are dropped).
+func (b *bufferRW) WriteHeader(status int) {
+	b.status = status
+}
+
 // cacheBustStaticJS wraps a static file server and rewrites relative module
 // specifiers inside .js/.mjs/.cjs responses. The vendored Discord SDK tree
 // has stable (unhashed) filenames, so without this it can be served stale by
@@ -296,6 +304,11 @@ func cacheBustStaticJS(next http.Handler) http.Handler {
 				w.Header().Add(k, v)
 			}
 		}
+		// FileServer resolves .mjs via the system mime table (or content
+		// sniffing), which yields text/plain — browsers enforce strict MIME
+		// checking for ES module scripts and reject that. Force a JavaScript
+		// type explicitly.
+		w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
 		if bw.status != http.StatusOK {
 			w.WriteHeader(bw.status)
 			w.Write(bw.body.Bytes())
