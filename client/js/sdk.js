@@ -110,6 +110,26 @@ const _postScoreToDiscord = async (imageBlob, text) => {
   } catch(e) { console.error('[' + gameTag + '] Upload failed', e); return false; }
 };
 
+// === Manual-send notice — the button is a fallback for the automatic send;
+// tell users who reach for it what the default flow is. ===
+const _showFallbackNotice = () => {
+  let el = document.getElementById('__fb3Notice');
+  if (el) el.remove();
+  el = document.createElement('div');
+  el.id = '__fb3Notice';
+  el.textContent = "Your score normally sends to this channel automatically when you finish the game — this button is only needed if that doesn't happen.";
+  el.style.cssText = 'position:fixed;left:50%;bottom:24px;transform:translateX(-50%);z-index:9999;' +
+    'max-width:min(480px,86vw);padding:12px 16px;border-radius:10px;text-align:center;' +
+    'background:#2b2d31;color:#e6e8ec;border:1px solid #5865F2;' +
+    'font:13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;' +
+    'box-shadow:0 8px 24px rgba(0,0,0,.45);opacity:0;transition:opacity .25s ease;pointer-events:none;';
+  document.body.appendChild(el);
+  requestAnimationFrame(() => { el.style.opacity = '1'; });
+  clearTimeout(el.__t1); clearTimeout(el.__t2);
+  el.__t1 = setTimeout(() => { el.style.opacity = '0'; }, 8000);
+  el.__t2 = setTimeout(() => el.remove(), 8400);
+};
+
 // === Auto-upload with daily guard (called by the game-completion observers) ===
 const _uploadScore = async (imageBlob, text) => {
   const todayKey = gameTag + '_uploaded_' + new Date().toDateString();
@@ -254,6 +274,7 @@ if (isSmush) {
     btn.style.cssText = 'background:#5865F2;color:#fff;border:none;cursor:pointer;font:inherit;padding:10px 16px;border-radius:8px;';
     btn.addEventListener('click', async (e) => {
       e.preventDefault();
+      _showFallbackNotice();
       btn.disabled = true; btn.textContent = 'Sending…';
       try {
         const c = await _smushCapture();
@@ -335,6 +356,7 @@ if (isSmush) {
     btn.style.cssText = 'background:#5865F2;color:#fff;border:none;cursor:pointer;font:inherit;padding:10px 16px;border-radius:8px;';
     btn.addEventListener('click', async (e) => {
       e.preventDefault();
+      _showFallbackNotice();
       const img = document.querySelector('#postHub #phCard img[src^="data:image"]');
       if (!img) return;
       btn.disabled = true; btn.textContent = 'Sending…';
