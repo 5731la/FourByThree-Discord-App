@@ -37,6 +37,10 @@ var cspMetaRe = regexp.MustCompile(`(?i)<meta[^>]+http-equiv=["']?Content-Securi
 // '>' in '=>' is indistinguishable from an HTML close-tag, so regex rewriting corrupts the JS.
 var inlineEventsRe = regexp.MustCompile(`(?i)\b(on(?:click|keydown|input|error|load|change|submit))=(["'][^"']*["'])`)
 
+// cfBeaconRe matches an injected Cloudflare Insights beacon script tag (if the
+// upstream/edge ever injects one) — blocked by Discord's script-src CSP.
+var cfBeaconRe = regexp.MustCompile(`(?is)<script\b[^>]*static\.cloudflareinsights\.com[^>]*/?>\s*(</script>)?`)
+
 // cacheBustParam is unique per server run (this process's PID) and is
 // appended as a query to every JS import in the game page HTML, so that
 // each server run busts Discord's cache of those bundles.
@@ -119,6 +123,20 @@ func cacheBustJSImports(body []byte) []byte {
 	return []byte(out.String())
 }
 
+// rewriteBundledAPIs rewrites third-party API URLs inside game JS bundles so the
+// browser talks to same-origin routes. Discord's activity CSP (added by their
+// discordsays.com proxy) blocks cross-origin connect-src and external scripts;
+// same-origin is allowed. Applied to every hankgreen.com JS response we serve.
+func rewriteBundledAPIs(body []byte) []byte {
+	// Puzzle schedule / promotions / community-puzzle API base (endpoints-*.js).
+	body = bytes.ReplaceAll(body, []byte("https://games-api.hankmt.workers.dev"), []byte("/fourbythree/hgapi"))
+	// Sentry DSN → empty string: the SDK then skips transport creation entirely
+	// (client ctor: `e.dsn ? ... : no-op`), so no CSP-blocked envelope requests.
+	// Error reporting from inside Discord's iframe is dropped on purpose.
+	body = bytes.ReplaceAll(body, []byte("https://1fe3fb18d942dde9af0fa50f8e480d9c@sentry.austinwitherspoon.com/8"), []byte(""))
+	return body
+}
+
 // cacheBustJSResponse rewrites a JS response body in place (module specifiers
 // get the per-run cache-bust query). Non-JS responses pass through untouched.
 func cacheBustJSResponse(resp *http.Response) error {
@@ -132,7 +150,7 @@ func cacheBustJSResponse(resp *http.Response) error {
 	if err != nil {
 		return err
 	}
-	modified := cacheBustJSImports(body)
+	modified := cacheBustJSImports(rewriteBundledAPIs(body))
 	resp.Body = io.NopCloser(bytes.NewReader(modified))
 	resp.ContentLength = int64(len(modified))
 	resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(modified)))
@@ -484,6 +502,7 @@ func main() {
 			// HTML body as well as the header, and its nonce blocks the game's
 			// own inline event handlers when served inside Discord's iframe.
 			modified = cspMetaRe.ReplaceAll(modified, nil)
+			modified = cfBeaconRe.ReplaceAll(modified, nil)
 
 			// Rewrite inline event handlers (onclick="..." -> data-onclick="...")
 			// so they bypass Discord's strict CSP blocking 'unsafe-inline'.
@@ -850,11 +869,14 @@ func main() {
 				modified = bytes.Replace(modified, []byte("function shareText(){"), []byte("window.shareText = function shareText(){"), 1)
 				modified = bytes.Replace(modified, []byte("</body>"), []byte(sdkScript+"\n</body>"), 1)
 				modified = cspMetaRe.ReplaceAll(modified, nil)
+				modified = cfBeaconRe.ReplaceAll(modified, nil)
 				modified = inlineEventsRe.ReplaceAll(modified, []byte(`data-$1=$2`))
 				// Cache-bust JS imports (?v=<pid>) so Discord never serves stale bundles.
 				modified = cacheBustJS(modified)
 			}
 			if isJS {
+				// Rewrite bundled third-party APIs to same-origin (CSP).
+				modified = rewriteBundledAPIs(modified)
 				// Bust relative module specifiers inside the bundle too.
 				modified = cacheBustJSImports(modified)
 			}
@@ -1003,6 +1025,33 @@ func main() {
 		log.Printf("[worker-proxy] → https://fourbythree-stats.hankmt.workers.dev%s", r.URL.Path)
 		workerProxy.ServeHTTP(w, r)
 	}
+// gamesAPIProxy forwards the puzzle-schedule API (games-api.hankmt.workers.dev).
+// Discord's activity CSP blocks cross-origin fetches, so bundles rewrite the
+// base URL to our same-origin /fourbythree/hgapi route (see rewriteBundledAPIs).
+	gamesTarget, _ := url.Parse("https://games-api.hankmt.workers.dev")
+	gamesAPIProxy := httputil.NewSingleHostReverseProxy(gamesTarget)
+	gamesAPIProxy.Transport = followRedirectsTransport{}
+	gamesAPIProxy.ModifyResponse = func(resp *http.Response) error {
+		log.Printf("[games-api] upstream %s %s → %d", resp.Request.Method, resp.Request.URL, resp.StatusCode)
+		resp.Header.Set("Access-Control-Allow-Origin", "*")
+		return nil
+	}
+	gamesAPIHandler := func(w http.ResponseWriter, r *http.Request) {
+		for _, pfx := range []string{"/fourbythree/fourbythree/hgapi", "/fourbythree/hgapi"} {
+			r.URL.Path = strings.TrimPrefix(r.URL.Path, pfx)
+			r.URL.RawPath = strings.TrimPrefix(r.URL.RawPath, pfx)
+		}
+		if r.URL.Path == "" {
+			r.URL.Path = "/"
+		}
+		r.Host = ""
+		log.Printf("[games-api] → https://games-api.hankmt.workers.dev%s", r.URL.Path)
+		gamesAPIProxy.ServeHTTP(w, r)
+	}
+	mux.HandleFunc("/fourbythree/fourbythree/hgapi/", gamesAPIHandler)
+	mux.HandleFunc("/fourbythree/fourbythree/hgapi", gamesAPIHandler)
+	mux.HandleFunc("/fourbythree/hgapi/", gamesAPIHandler)
+	mux.HandleFunc("/fourbythree/hgapi", gamesAPIHandler)
 
 	assetTarget, _ := url.Parse("https://www.hankgreen.com")
 	assetProxy := httputil.NewSingleHostReverseProxy(assetTarget)
@@ -1106,6 +1155,7 @@ func main() {
 			// HTML body as well as the header, and its nonce blocks the game's
 			// own inline event handlers when served inside Discord's iframe.
 			modified = cspMetaRe.ReplaceAll(modified, nil)
+			modified = cfBeaconRe.ReplaceAll(modified, nil)
 
 			// Rewrite inline event handlers (onclick="..." -> data-onclick="...")
 			// so they bypass Discord's strict CSP blocking 'unsafe-inline'.

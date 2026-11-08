@@ -88,51 +88,41 @@ _patchArrowOnclicks();
 document.addEventListener('DOMContentLoaded', _patchArrowOnclicks);
 new MutationObserver(_patchArrowOnclicks).observe(document.documentElement, { childList: true, subtree: true });
 
-// === Core share function — posts score image to Discord via the Go proxy. ===
-// Used by _uploadScore (with daily guard), the 4x3 showResult hook, and the footer button.
-const _postScoreToDiscord = async () => {
-  if (!authenticatedUserId) {
-    console.warn('[' + gameTag + '] Not authenticated');
-    return;
-  }
+// === Core share function — posts a score image + text to Discord via the Go proxy. ===
+const _postScoreToDiscord = async (imageBlob, text) => {
+  if (!authenticatedUserId) { console.warn('[' + gameTag + '] Not authenticated'); return false; }
+  if (!imageBlob) { console.error('[' + gameTag + '] No score image available'); return false; }
   try {
-    const canvas = typeof window.drawShareCard === 'function' ? window.drawShareCard() : null;
-    if (!canvas) { console.error('[' + gameTag + '] drawShareCard not available'); return; }
-    canvas.toBlob(async blob => {
-      if (!blob) return;
-      const formData = new FormData();
-      formData.append('image', blob, 'result.png');
-      formData.append('user_id', authenticatedUserId);
-      if (window.discordSdk && window.discordSdk.channelId) {
-        formData.append('channel_id', window.discordSdk.channelId);
-      }
-      try {
-        formData.append('text_result',
-          typeof window.shareText === 'function' ? window.shareText() :
-          (typeof window.resultDescription === 'function' ? window.resultDescription() : ''));
-      } catch(e) {}
-      if (window.__puzzleLink) { formData.append('puzzle_link', window.__puzzleLink); }
-      const _cheatedDate = getCheatedDate();
-      if (_cheatedDate) { formData.append('cheated', _cheatedDate); }
-      const res = await fetch('api/result', { method: 'POST', body: formData });
-      if (res.ok) {
-        console.log('[' + gameTag + '] Score shared to chat!');
-        if (typeof window.toast === 'function') window.toast("Score shared to chat!", 3000);
-      } else {
-        console.warn('[' + gameTag + '] Share failed');
-      }
-    });
-  } catch(e) { console.error('[' + gameTag + '] Upload failed', e); }
+    const formData = new FormData();
+    formData.append('image', imageBlob, 'result.png');
+    formData.append('user_id', authenticatedUserId);
+    if (window.discordSdk && window.discordSdk.channelId) {
+      formData.append('channel_id', window.discordSdk.channelId);
+    }
+    formData.append('text_result', text || '');
+    if (window.__puzzleLink) { formData.append('puzzle_link', window.__puzzleLink); }
+    const _cheatedDate = getCheatedDate();
+    if (_cheatedDate) { formData.append('cheated', _cheatedDate); }
+    const res = await fetch('api/result', { method: 'POST', body: formData });
+    if (res.ok) { console.log('[' + gameTag + '] Score shared to chat!'); }
+    else { console.warn('[' + gameTag + '] Share failed'); }
+    return res.ok;
+  } catch(e) { console.error('[' + gameTag + '] Upload failed', e); return false; }
 };
 
-// === Auto-upload with daily guard (called by game completion observers) ===
-const _uploadScore = async () => {
+// === Auto-upload with daily guard (called by the game-completion observers) ===
+const _uploadScore = async (imageBlob, text) => {
   const todayKey = gameTag + '_uploaded_' + new Date().toDateString();
   if (window['__' + gameTag + 'Uploaded'] || !inDiscord || !authenticatedUserId || localStorage.getItem(todayKey)) return;
   window['__' + gameTag + 'Uploaded'] = true;
   localStorage.setItem(todayKey, '1');
-  await _postScoreToDiscord();
+  await _postScoreToDiscord(imageBlob, text);
 };
+
+// === DOM capture helpers (new Vite/React build: no window globals; the result UI
+// renders the share card as a data: URL <img> and the share text in known nodes) ===
+const _sleep = ms => new Promise(r => setTimeout(r, ms));
+const _cardBlobFromImg = async img => (await fetch(img.currentSrc || img.src)).blob();
 
 // === Cheating flag ===
 // Resetting the board (smush: 5 quick logo clicks; 4x3: the secret key combo
@@ -209,21 +199,76 @@ function confirmCheatReset() {
 }
 
 if (isSmush) {
-  // Smush: observe #finalScore in #mbody (game over modal container).
-  const _smushObserver = new MutationObserver(() => {
-    if (document.getElementById('finalScore')) {
-      _uploadScore();
-      _smushObserver.disconnect();
+  // Smush (new Vite/React build): #smushResults auto-opens on game over; the share
+  // card only renders in #smushShare (img.sharecard data: URL + .sharetxt text).
+  // Note: the shared modal component portals #smushResults/#smushShare into <body>
+  // at mount with inline display:none, so "element exists" does NOT mean "open" —
+  // gate on computed visibility. Success locks permanently; a failed attempt (no
+  // card) stays retryable via the observer.
+  let _smushDone = false;
+  let _smushInFlight = false;
+  const _smushModalVisible = () =>
+    [...document.querySelectorAll('#smushResults')]
+      .some(el => getComputedStyle(el).display !== 'none');
+  const _smushCapture = async () => {
+    for (let i = 0; i < 60; i++) {
+      const shareBtn = [...document.querySelectorAll('#smushResults button')]
+        .find(b => (b.textContent || '').trim() === 'Share');
+      if (shareBtn) shareBtn.click(); // opens #smushShare (no-op if already open)
+      const img = document.querySelector('#smushShare img.sharecard[src^="data:image"]');
+      if (img) {
+        const textEl = document.querySelector('#smushShare .sharetxt');
+        return { blob: await _cardBlobFromImg(img), text: textEl ? textEl.innerText : '' };
+      }
+      await _sleep(100);
     }
-  });
-  const mbody = document.getElementById('mbody');
-  if (mbody) {
-    _smushObserver.observe(mbody, { childList: true, subtree: true });
-    if (document.getElementById('finalScore')) _uploadScore();
-  } else {
-    _smushObserver.observe(document.body, { childList: true, subtree: true });
-  }
-  console.log('[' + gameTag + '] gameOver observer installed');
+    return null;
+  };
+  const _trySmush = async () => {
+    if (_smushDone || _smushInFlight) return;
+    if (!_smushModalVisible()) return; // pre-rendered closed modal — wait for game over
+    _smushInFlight = true;
+    try {
+      await _sleep(400); // let the results modal settle (community-stats fetch, animations)
+      const c = await _smushCapture();
+      if (c) { await _uploadScore(c.blob, c.text); _smushDone = true; }
+      else console.warn('[' + gameTag + '] smush share card not found');
+    } finally { _smushInFlight = false; }
+  };
+  const _startSmushObserver = () => {
+    if (window.__fb3ObsSmush) return;
+    _trySmush(); // covers a reload with the modal already open; no-op while closed
+    window.__fb3ObsSmush = new MutationObserver(() => _trySmush());
+    window.__fb3ObsSmush.observe(document.body, { childList: true, subtree: true });
+  };
+  _startSmushObserver();
+  document.addEventListener('DOMContentLoaded', _startSmushObserver);
+
+  // "Send to Discord" button in the results modal (manual send / re-send).
+  const _addSmushButton = () => {
+    const row = document.querySelector('#smushResults .rowbtns');
+    if (!row || row.querySelector('#__fb3Send')) return;
+    const btn = document.createElement('button');
+    btn.id = '__fb3Send'; btn.type = 'button'; btn.className = 'hbtn';
+    btn.textContent = 'Send to Discord';
+    btn.style.cssText = 'background:#5865F2;color:#fff;border:none;cursor:pointer;font:inherit;padding:10px 16px;border-radius:8px;';
+    btn.addEventListener('click', async (e) => {
+      e.preventDefault();
+      btn.disabled = true; btn.textContent = 'Sending…';
+      try {
+        const c = await _smushCapture();
+        if (c) await _postScoreToDiscord(c.blob, c.text);
+      } finally { btn.disabled = false; btn.textContent = 'Send to Discord'; }
+    });
+    row.appendChild(btn);
+  };
+  const _watchSmushButton = () => {
+    if (window.__fb3BtnSmush) return;
+    window.__fb3BtnSmush = new MutationObserver(() => _addSmushButton());
+    window.__fb3BtnSmush.observe(document.body, { childList: true, subtree: true });
+  };
+  _watchSmushButton();
+  document.addEventListener('DOMContentLoaded', _watchSmushButton);
 
   // Intercept the secret reset: 5 quick clicks on #title .logo. The game
   // counts its own clicks in a bubble listener on the logo element; we count
@@ -253,44 +298,58 @@ if (isSmush) {
     _resetTapTimer = setTimeout(() => { _resetTaps = 0; }, 1500);
   }, true);
 } else {
-  // 4x3: hook showResult — only upload once per game.
-  // Set __uploadedResult = true BEFORE the async toBlob call to block
-  // rapid successive showResult() calls that can race the flag.
-  const _hookShowResult = () => {
-    if (typeof window.showResult !== 'function') { setTimeout(_hookShowResult, 200); return; }
-    const _origShowResult = window.showResult;
-    window.showResult = function(won, score, fancy, quiet) {
-      _origShowResult.apply(this, arguments);
-      const todayKey = '4x3_uploaded_' + new Date().toDateString();
-      if (window.__uploadedResult || localStorage.getItem(todayKey) || !inDiscord || !authenticatedUserId) return;
-      window.__uploadedResult = true;
-      localStorage.setItem(todayKey, '1');
-      _postScoreToDiscord();
-    };
+  // 4x3 (new Vite/React build): #postHub auto-renders on completion and holds the
+  // share card at #postHub #phCard img (data: URL; alt = exact game share text).
+  let _4x3Started = false;
+  const _try4x3 = async () => {
+    if (_4x3Started) return;
+    if (!document.querySelector('#postHub')) return;
+    _4x3Started = true; // single-flight: never re-run per mutation
+    let img = null;
+    for (let i = 0; i < 60 && !img; i++) {
+      img = document.querySelector('#postHub #phCard img[src^="data:image"]');
+      if (!img) await _sleep(100);
+    }
+    if (!img) { console.warn('[' + gameTag + '] share card not found in #postHub'); return; }
+    try {
+      const blob = await _cardBlobFromImg(img);
+      await _uploadScore(blob, img.getAttribute('alt') || '');
+    } catch(e) { console.warn('[' + gameTag + '] 4x3 capture failed', e); }
   };
-  _hookShowResult();
+  const _start4x3Observer = () => {
+    if (window.__fb3Obs4x3) return;
+    if (document.querySelector('#postHub')) { _try4x3(); return; }
+    window.__fb3Obs4x3 = new MutationObserver(() => _try4x3());
+    window.__fb3Obs4x3.observe(document.body, { childList: true, subtree: true });
+  };
+  _start4x3Observer();
+  document.addEventListener('DOMContentLoaded', _start4x3Observer);
 
-  // Intercept the secret reset: the up/up/down/down/up/up key combo and the
-  // hidden test menu's "Reset puzzle" button both call the global
-  // resetPuzzle(), so wrapping that single choke point covers both.
-  const _hookResetPuzzle = () => {
-    if (typeof window.resetPuzzle !== 'function') { setTimeout(_hookResetPuzzle, 200); return; }
-    if (window.__resetHooked) return;
-    window.__resetHooked = true;
-    const _origReset = window.resetPuzzle;
-    window.resetPuzzle = function(...args) {
-      // If today's cheat warning was already accepted (e.g. the user opened the
-      // test menu via the logo-tap flow and then clicked "Reset puzzle"), do not
-      // prompt a second time — just perform the reset.
-      if (getCheatedDate()) { _origReset.apply(this, args); return; }
-      confirmCheatReset().then((ok) => {
-        if (!ok) { console.warn('[' + gameTag + '] puzzle reset declined — progress kept'); return; }
-        markCheated();
-        _origReset.apply(this, args);
-      });
-    };
+  // "Send to Discord" button on the result screen (manual re-send, no daily guard).
+  const _add4x3Button = () => {
+    const row = document.querySelector('#postHub .rowbtns');
+    if (!row || row.querySelector('#__fb3Send')) return;
+    const btn = document.createElement('button');
+    btn.id = '__fb3Send'; btn.type = 'button'; btn.className = 'hbtn';
+    btn.textContent = 'Send to Discord';
+    btn.style.cssText = 'background:#5865F2;color:#fff;border:none;cursor:pointer;font:inherit;padding:10px 16px;border-radius:8px;';
+    btn.addEventListener('click', async (e) => {
+      e.preventDefault();
+      const img = document.querySelector('#postHub #phCard img[src^="data:image"]');
+      if (!img) return;
+      btn.disabled = true; btn.textContent = 'Sending…';
+      try { await _postScoreToDiscord(await _cardBlobFromImg(img), img.getAttribute('alt') || ''); }
+      finally { btn.disabled = false; btn.textContent = 'Send to Discord'; }
+    });
+    row.appendChild(btn);
   };
-  _hookResetPuzzle();
+  const _watch4x3Button = () => {
+    if (window.__fb3Btn4x3) return;
+    window.__fb3Btn4x3 = new MutationObserver(() => _add4x3Button());
+    window.__fb3Btn4x3.observe(document.body, { childList: true, subtree: true });
+  };
+  _watch4x3Button();
+  document.addEventListener('DOMContentLoaded', _watch4x3Button);
 
   // Intercept the secret 7-tap logo flow. The game's bubble listener on
   // header .logo counts 7 taps in a 1.5s window then calls askTestCode(), which
@@ -415,20 +474,3 @@ if (isSmush) {
   }, true);
 }
 
-// === Footer "Share to Discord" button (no daily guard — for re-entry after timeout) ===
-const _addShareButton = () => {
-  if (window.__shareButtonAdded) return;
-  const footLinks = document.querySelector('.foot-links');
-  if (!footLinks) return;
-  window.__shareButtonAdded = true;
-  const btn = document.createElement('a');
-  btn.textContent = 'Share to Discord';
-  btn.style.cursor = 'pointer';
-  btn.addEventListener('click', (e) => {
-    e.preventDefault();
-    _postScoreToDiscord();
-  });
-  footLinks.appendChild(btn);
-};
-_addShareButton();
-document.addEventListener('DOMContentLoaded', _addShareButton);
