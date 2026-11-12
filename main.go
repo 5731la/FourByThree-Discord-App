@@ -41,6 +41,13 @@ var inlineEventsRe = regexp.MustCompile(`(?i)\b(on(?:click|keydown|input|error|l
 // upstream/edge ever injects one) — blocked by Discord's script-src CSP.
 var cfBeaconRe = regexp.MustCompile(`(?is)<script\b[^>]*static\.cloudflareinsights\.com[^>]*/?>\s*(</script>)?`)
 
+// gamesAPIBaseRe matches the games-api base URL in bundles regardless of the
+// specific host — the site has rotated this domain (hankmt.workers.dev →
+// hankgreen.com) and will likely do so again. The char class stops at '/', so
+// only the host is replaced and any trailing path is preserved, which rewrites
+// both bare-base and full-URL occurrences to our same-origin route.
+var gamesAPIBaseRe = regexp.MustCompile(`https://games-api\.[A-Za-z0-9.-]+`)
+
 // cacheBustParam is unique per server run (this process's PID) and is
 // appended as a query to every JS import in the game page HTML, so that
 // each server run busts Discord's cache of those bundles.
@@ -129,7 +136,9 @@ func cacheBustJSImports(body []byte) []byte {
 // same-origin is allowed. Applied to every hankgreen.com JS response we serve.
 func rewriteBundledAPIs(body []byte) []byte {
 	// Puzzle schedule / promotions / community-puzzle API base (endpoints-*.js).
-	body = bytes.ReplaceAll(body, []byte("https://games-api.hankmt.workers.dev"), []byte("/fourbythree/hgapi"))
+	// Host-agnostic: matches any games-api.<domain> so a future domain rotation
+	// (already happened once) cannot break the rewrite again.
+	body = gamesAPIBaseRe.ReplaceAll(body, []byte("/fourbythree/hgapi"))
 	// Sentry DSN → empty string: the SDK then skips transport creation entirely
 	// (client ctor: `e.dsn ? ... : no-op`), so no CSP-blocked envelope requests.
 	// Error reporting from inside Discord's iframe is dropped on purpose.
@@ -1025,10 +1034,10 @@ func main() {
 		log.Printf("[worker-proxy] → https://fourbythree-stats.hankmt.workers.dev%s", r.URL.Path)
 		workerProxy.ServeHTTP(w, r)
 	}
-// gamesAPIProxy forwards the puzzle-schedule API (games-api.hankmt.workers.dev).
+// gamesAPIProxy forwards the puzzle-schedule API (games-api.hankgreen.com).
 // Discord's activity CSP blocks cross-origin fetches, so bundles rewrite the
 // base URL to our same-origin /fourbythree/hgapi route (see rewriteBundledAPIs).
-	gamesTarget, _ := url.Parse("https://games-api.hankmt.workers.dev")
+	gamesTarget, _ := url.Parse("https://games-api.hankgreen.com")
 	gamesAPIProxy := httputil.NewSingleHostReverseProxy(gamesTarget)
 	gamesAPIProxy.Transport = followRedirectsTransport{}
 	gamesAPIProxy.ModifyResponse = func(resp *http.Response) error {
@@ -1045,7 +1054,7 @@ func main() {
 			r.URL.Path = "/"
 		}
 		r.Host = ""
-		log.Printf("[games-api] → https://games-api.hankmt.workers.dev%s", r.URL.Path)
+		log.Printf("[games-api] → https://games-api.hankgreen.com%s", r.URL.Path)
 		gamesAPIProxy.ServeHTTP(w, r)
 	}
 	mux.HandleFunc("/fourbythree/fourbythree/hgapi/", gamesAPIHandler)
